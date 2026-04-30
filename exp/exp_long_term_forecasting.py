@@ -19,6 +19,27 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast, self).__init__(args)
 
+    def _model_core(self):
+        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
+    def _maybe_build_memory(self, train_loader):
+        model_core = self._model_core()
+        if hasattr(model_core, 'build_memory'):
+            print('>>>>>>>building offline branch memory<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<')
+            model_core.build_memory(train_loader, self.device)
+
+    def _forward_model(self, batch_x, batch_x_mark, dec_inp, batch_y_mark, future_y=None):
+        model_core = self._model_core()
+        if future_y is not None and hasattr(model_core, 'get_auxiliary_loss'):
+            return self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, future_y=future_y)
+        return self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+    def _auxiliary_loss(self):
+        model_core = self._model_core()
+        if hasattr(model_core, 'get_auxiliary_loss'):
+            return model_core.get_auxiliary_loss()
+        return None
+
     def _build_model(self):
         model = self.model_dict[self.args.model](self.args).float()
 
@@ -77,6 +98,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
+        self._maybe_build_memory(train_loader)
 
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
@@ -112,22 +134,29 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
                 # encoder - decoder
+                future_y = batch_y[:, -self.args.pred_len:, :].detach()
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs = self._forward_model(batch_x, batch_x_mark, dec_inp, batch_y_mark, future_y=future_y)
 
                         f_dim = -1 if self.args.features == 'MS' else 0
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
+                        aux_loss = self._auxiliary_loss()
+                        if aux_loss is not None:
+                            loss = loss + aux_loss
                         train_loss.append(loss.item())
                 else:
-                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs = self._forward_model(batch_x, batch_x_mark, dec_inp, batch_y_mark, future_y=future_y)
 
                     f_dim = -1 if self.args.features == 'MS' else 0
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = criterion(outputs, batch_y)
+                    aux_loss = self._auxiliary_loss()
+                    if aux_loss is not None:
+                        loss = loss + aux_loss
                     train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:

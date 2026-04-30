@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="780" viewBox="0 0 1400 780">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#263238"/>
+    </marker>
+    <style>
+      .title { font: 700 28px Arial, sans-serif; fill: #111827; }
+      .subtitle { font: 500 17px Arial, sans-serif; fill: #374151; }
+      .label { font: 600 18px Arial, sans-serif; fill: #111827; }
+      .small { font: 500 14px Arial, sans-serif; fill: #374151; }
+      .tiny { font: 500 12px Arial, sans-serif; fill: #4b5563; }
+      .box { stroke: #263238; stroke-width: 2; rx: 8; ry: 8; }
+      .soft { fill: #f8fafc; }
+      .blue { fill: #dbeafe; }
+      .green { fill: #dcfce7; }
+      .amber { fill: #fef3c7; }
+      .rose { fill: #ffe4e6; }
+      .violet { fill: #ede9fe; }
+      .line { stroke: #263238; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #6b7280; stroke-width: 2; fill: none; stroke-dasharray: 8 6; marker-end: url(#arrow); }
+      .thin { stroke: #6b7280; stroke-width: 1.5; fill: none; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1400" height="780" fill="#ffffff"/>
+  <text x="60" y="55" class="title">BranchWorldModel: Retrieval-Conditioned Latent World Model for Time-Series Forecasting</text>
+  <text x="60" y="86" class="subtitle">Memory stores latent future branch prototypes; retrieved branches condition the transition law rather than acting as decoder features.</text>
+
+  <rect x="48" y="126" width="410" height="570" class="box soft"/>
+  <text x="76" y="164" class="label">Offline Future Branch Discovery</text>
+  <text x="76" y="192" class="small">training windows only</text>
+
+  <rect x="78" y="230" width="150" height="72" class="box blue"/>
+  <text x="101" y="259" class="small">Past window</text>
+  <text x="98" y="282" class="tiny">x[i-L+1 : i]</text>
+
+  <rect x="278" y="230" width="150" height="72" class="box green"/>
+  <text x="300" y="259" class="small">Future horizon</text>
+  <text x="300" y="282" class="tiny">x[i+1 : i+H]</text>
+
+  <rect x="78" y="345" width="150" height="78" class="box blue"/>
+  <text x="94" y="374" class="small">State Encoder</text>
+  <text x="93" y="397" class="tiny">z_i, q_i = E_state(.)</text>
+
+  <rect x="278" y="345" width="150" height="78" class="box green"/>
+  <text x="286" y="374" class="small">Future Encoder</text>
+  <text x="293" y="397" class="tiny">u_i = E_traj(Delta z)</text>
+
+  <rect x="96" y="478" width="312" height="86" class="box amber"/>
+  <text x="123" y="509" class="small">Local state neighborhood</text>
+  <text x="121" y="533" class="tiny">TopK sim(q_t, q_i), then cluster future codes u_i</text>
+
+  <rect x="96" y="602" width="312" height="62" class="box rose"/>
+  <text x="122" y="628" class="small">Branch prototype memory</text>
+  <text x="122" y="650" class="tiny">M = {(c_m, b_m)}: state prototype + future dynamics prototype</text>
+
+  <path d="M153 302 L153 345" class="line"/>
+  <path d="M353 302 L353 345" class="line"/>
+  <path d="M153 423 L205 478" class="line"/>
+  <path d="M353 423 L300 478" class="line"/>
+  <path d="M252 564 L252 602" class="line"/>
+
+  <rect x="520" y="126" width="830" height="570" class="box soft"/>
+  <text x="548" y="164" class="label">Online Forecasting with Branch-Conditioned Rollout</text>
+  <text x="548" y="192" class="small">query window at time t</text>
+
+  <rect x="552" y="236" width="170" height="76" class="box blue"/>
+  <text x="584" y="265" class="small">Input window</text>
+  <text x="583" y="288" class="tiny">x[t-L+1 : t]</text>
+
+  <rect x="552" y="360" width="170" height="86" class="box blue"/>
+  <text x="576" y="391" class="small">Branch-aware</text>
+  <text x="579" y="414" class="small">state encoder</text>
+  <text x="594" y="435" class="tiny">z_t, q_t</text>
+
+  <rect x="798" y="360" width="190" height="86" class="box rose"/>
+  <text x="824" y="391" class="small">Retrieve top-K</text>
+  <text x="820" y="414" class="small">branch prototypes</text>
+  <text x="834" y="435" class="tiny">r^(k) = phi(c_k, b_k, sim)</text>
+
+  <rect x="1060" y="236" width="230" height="76" class="box violet"/>
+  <text x="1105" y="265" class="small">Branch 1 rollout</text>
+  <text x="1093" y="288" class="tiny">z[t+h] = f(z[t+h-1], r1)</text>
+
+  <rect x="1060" y="352" width="230" height="76" class="box violet"/>
+  <text x="1105" y="381" class="small">Branch k rollout</text>
+  <text x="1093" y="404" class="tiny">z[t+h] = f(z[t+h-1], rk)</text>
+
+  <rect x="1060" y="468" width="230" height="76" class="box violet"/>
+  <text x="1105" y="497" class="small">Branch K rollout</text>
+  <text x="1093" y="520" class="tiny">z[t+h] = f(z[t+h-1], rK)</text>
+
+  <rect x="824" y="538" width="198" height="76" class="box amber"/>
+  <text x="852" y="568" class="small">Branch selector</text>
+  <text x="854" y="590" class="tiny">pi_k = g(z_t, c_k, b_k)</text>
+
+  <rect x="1098" y="602" width="192" height="62" class="box green"/>
+  <text x="1143" y="628" class="small">Mixture output</text>
+  <text x="1131" y="650" class="tiny">y_hat = sum_k pi_k Dec(z^k)</text>
+
+  <path d="M637 312 L637 360" class="line"/>
+  <path d="M722 403 L798 403" class="line"/>
+  <path d="M408 633 C470 633 470 403 552 403" class="dash"/>
+  <path d="M988 390 C1020 350 1025 280 1060 274" class="line"/>
+  <path d="M988 403 L1060 390" class="line"/>
+  <path d="M988 416 C1020 455 1028 500 1060 506" class="line"/>
+  <path d="M893 446 L893 538" class="line"/>
+  <path d="M1175 312 L1175 352" class="thin"/>
+  <path d="M1175 428 L1175 468" class="thin"/>
+  <path d="M1290 274 C1340 360 1340 570 1290 628" class="line"/>
+  <path d="M1290 390 C1330 430 1330 580 1290 628" class="line"/>
+  <path d="M1290 506 C1320 535 1320 598 1290 628" class="line"/>
+  <path d="M1022 576 L1098 628" class="line"/>
+
+  <rect x="552" y="568" width="210" height="76" class="box green"/>
+  <text x="585" y="597" class="small">Training signals</text>
+  <text x="575" y="620" class="tiny">forecast loss + latent consistency</text>
+  <text x="591" y="640" class="tiny">oracle branch + diversity</text>
+
+  <path d="M1060 506 C970 530 880 560 762 606" class="dash"/>
+  <path d="M1060 390 C960 440 850 520 762 606" class="dash"/>
+</svg>

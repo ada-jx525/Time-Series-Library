@@ -1,0 +1,16 @@
+# Minimal dependencies for BranchWorldModel long-term forecasting experiments.
+# Compatible with Python 3.10/3.11. Install PyTorch separately according to
+# the CUDA version on the remote server.
+
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.5.2
+scipy==1.13.1
+matplotlib==3.9.2
+tqdm==4.66.5
+
+# Optional but useful for running other built-in baselines in this repository.
+einops==0.8.1
+local-attention==1.11.2
+reformer-pytorch==1.4.4
+PyWavelets==1.8.0

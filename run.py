@@ -12,11 +12,11 @@ if __name__ == '__main__':
     torch.manual_seed(fix_seed)
     np.random.seed(fix_seed)
 
-    parser = argparse.ArgumentParser(description='TimesNet')
+    parser = argparse.ArgumentParser(description='BranchWorld long-term forecasting')
 
     # basic config
     parser.add_argument('--task_name', type=str, required=True, default='long_term_forecast',
-                        help='task name, options:[long_term_forecast, short_term_forecast, imputation, classification, anomaly_detection]')
+                        help='task name, only long_term_forecast is supported in this cleaned research codebase')
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='Autoformer',
@@ -156,6 +156,45 @@ if __name__ == '__main__':
     parser.add_argument('--top_p', type=float, default=0.5, help='Dynamic Routing in MoE')
     parser.add_argument('--pos', type=int, choices=[0, 1], default=1, help='Positional Embedding. Set pos to 0 or 1')
 
+    # BranchWorldModel: retrieval-conditioned latent world model
+    parser.add_argument('--wm_latent_dim', type=int, default=256,
+                        help='BranchWorld latent state dimension')
+    parser.add_argument('--wm_branch_num', type=int, default=4,
+                        help='number of future branch prototypes discovered per local neighborhood')
+    parser.add_argument('--wm_retrieve_k', type=int, default=4,
+                        help='number of branch prototypes retrieved for rollout')
+    parser.add_argument('--wm_neighbor_k', type=int, default=64,
+                        help='state-neighborhood size used during offline branch discovery')
+    parser.add_argument('--wm_memory_size', type=int, default=2048,
+                        help='maximum number of training windows/prototypes used in BranchWorld memory')
+    parser.add_argument('--wm_kmeans_iters', type=int, default=8,
+                        help='k-means iterations for offline future branch discovery')
+    parser.add_argument('--wm_aux_weight', type=float, default=0.1,
+                        help='latent rollout consistency loss weight')
+    parser.add_argument('--wm_oracle_weight', type=float, default=0.1,
+                        help='oracle branch forecast loss weight')
+    parser.add_argument('--wm_diversity_weight', type=float, default=0.02,
+                        help='branch diversity regularization weight')
+    parser.add_argument('--wm_use_memory', type=int, choices=[0, 1], default=1,
+                        help='use offline branch memory; 0 falls back to learned branch priors')
+    parser.add_argument('--wm_use_branch_discovery', type=int, choices=[0, 1], default=1,
+                        help='1 clusters local futures into prototypes; 0 stores raw trajectory codes')
+    parser.add_argument('--wm_use_gating', type=int, choices=[0, 1], default=1,
+                        help='use learned branch selector; 0 uses retrieval-similarity weights')
+    parser.add_argument('--wm_use_aux_losses', type=int, choices=[0, 1], default=1,
+                        help='use latent consistency/oracle/diversity auxiliary losses')
+    parser.add_argument('--wm_head_type', type=str, choices=['shared', 'moe'], default='moe',
+                        help='forecast head type: shared decoder with gating, or branch-specialized MoE head')
+    parser.add_argument('--wm_balance_weight', type=float, default=0.01,
+                        help='load-balancing regularization weight for BranchWorld MoE router')
+    parser.add_argument('--wm_backbone', type=str, default='patch_transformer',
+                        choices=['temporal_transformer', 'patch_transformer', 'inverted_transformer', 'tcn', 'mlp'],
+                        help='state encoder backbone for BranchWorldModel')
+    parser.add_argument('--wm_patch_len', type=int, default=16,
+                        help='patch length for BranchWorld patch_transformer backbone')
+    parser.add_argument('--wm_freeze_backbone', type=int, choices=[0, 1], default=1,
+                        help='freeze BranchWorld state backbone; default 1 trains the memory reasoning head')
+
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:
         args.device = torch.device('cuda:{}'.format(args.gpu))
@@ -177,27 +216,10 @@ if __name__ == '__main__':
     print_args(args)
 
 
-    if args.task_name == 'long_term_forecast':
-        from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
-        Exp = Exp_Long_Term_Forecast
-    elif args.task_name == 'short_term_forecast':
-        from exp.exp_short_term_forecasting import Exp_Short_Term_Forecast
-        Exp = Exp_Short_Term_Forecast
-    elif args.task_name == 'imputation':
-        from exp.exp_imputation import Exp_Imputation
-        Exp = Exp_Imputation
-    elif args.task_name == 'anomaly_detection':
-        from exp.exp_anomaly_detection import Exp_Anomaly_Detection
-        Exp = Exp_Anomaly_Detection
-    elif args.task_name == 'classification':
-        from exp.exp_classification import Exp_Classification
-        Exp = Exp_Classification
-    elif args.task_name == 'zero_shot_forecast':
-        from exp.exp_zero_shot_forecasting import Exp_Zero_Shot_Forecast
-        Exp = Exp_Zero_Shot_Forecast
-    else:
-        from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
-        Exp = Exp_Long_Term_Forecast
+    if args.task_name != 'long_term_forecast':
+        raise ValueError('This cleaned BranchWorld codebase only supports --task_name long_term_forecast.')
+    from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
+    Exp = Exp_Long_Term_Forecast
 
     if args.is_training:
         for ii in range(args.itr):
