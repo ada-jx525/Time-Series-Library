@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 class SinusoidalPosition(nn.Module):
-    """Fixed positional encoding for latent state and future trajectory encoders."""
+    """Fixed positional encoding used by the latent state encoder."""
 
     def __init__(self, d_model, max_len=4096):
         super().__init__()
@@ -21,13 +21,39 @@ class SinusoidalPosition(nn.Module):
         return self.pe[:, :length]
 
 
-class BranchAwareLatentStateEncoder(nn.Module):
-    """
-    Encodes the observed window into two latents:
-    - state: transition-aware latent used by the rollout dynamics.
-    - retrieval_state: L2-normalized projection used by branch memory retrieval.
-    """
+class AttentionPool(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
 
+    def forward(self, x):
+        weight = torch.softmax(self.score(x), dim=1)
+        return (x * weight).sum(dim=1)
+
+
+class PreNormMLP(nn.Module):
+    """Small pre-norm residual MLP block."""
+
+    def __init__(self, dim, hidden_dim, dropout=0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+        )
+
+    def forward(self, x):
+        return x + self.net(self.norm(x))
+
+
+class StateBackbone(nn.Module):
     def __init__(
         self,
         c_in,
@@ -37,68 +63,31 @@ class BranchAwareLatentStateEncoder(nn.Module):
         d_ff,
         e_layers,
         dropout,
-        latent_dim,
         backbone="patch_transformer",
         patch_len=16,
-        freeze_backbone=False,
+        patch_stride=None,
     ):
-        super().__init__()
-        self.backbone_name = backbone
-        self.backbone = StateBackbone(
-            c_in=c_in,
-            seq_len=seq_len,
-            d_model=d_model,
-            n_heads=n_heads,
-            d_ff=d_ff,
-            e_layers=e_layers,
-            dropout=dropout,
-            backbone=backbone,
-            patch_len=patch_len,
-        )
-        self.state_head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, latent_dim),
-            nn.GELU(),
-            nn.Linear(latent_dim, latent_dim),
-        )
-        self.retrieval_head = nn.Sequential(
-            nn.LayerNorm(latent_dim),
-            nn.Linear(latent_dim, latent_dim),
-        )
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-
-    def forward(self, x):
-        # x: [B, L, C], where L is look-back length and C is number of variables.
-        pooled = self.backbone(x)  # [B, D], state summary from the selected backbone.
-        state = self.state_head(pooled)  # [B, Z]
-        retrieval_state = F.normalize(self.retrieval_head(state), dim=-1)  # [B, Z]
-        return state, retrieval_state
-
-
-class StateBackbone(nn.Module):
-    """Backbone zoo for BranchWorld state encoding."""
-
-    def __init__(self, c_in, seq_len, d_model, n_heads, d_ff, e_layers, dropout, backbone, patch_len):
         super().__init__()
         self.backbone = backbone
         self.seq_len = seq_len
         self.patch_len = max(1, min(patch_len, seq_len))
+        self.patch_stride = max(1, patch_stride or max(1, self.patch_len // 2))
 
         if backbone == "temporal_transformer":
             self.value_proj = nn.Linear(c_in, d_model)
             self.position = SinusoidalPosition(d_model)
-            self.encoder = _make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout)
+            self.encoder = make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout)
+            self.pool = AttentionPool(d_model)
         elif backbone == "patch_transformer":
             self.patch_proj = nn.Linear(c_in * self.patch_len, d_model)
             self.position = SinusoidalPosition(d_model)
-            self.encoder = _make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout)
+            self.encoder = make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout)
+            self.pool = AttentionPool(d_model)
         elif backbone == "inverted_transformer":
-            # iTransformer-style: each variable becomes a token whose features are the full look-back sequence.
             self.value_proj = nn.Linear(seq_len, d_model)
             self.var_embedding = nn.Parameter(torch.randn(1, c_in, d_model) * 0.02)
-            self.encoder = _make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout)
+            self.encoder = make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout)
+            self.pool = AttentionPool(d_model)
         elif backbone == "tcn":
             layers = []
             in_ch = c_in
@@ -123,46 +112,108 @@ class StateBackbone(nn.Module):
             )
         else:
             raise ValueError(
-                f"Unknown wm_backbone={backbone}. Choose from "
-                "temporal_transformer, patch_transformer, inverted_transformer, tcn, mlp."
+                "Unknown wm_backbone={}. Choose from temporal_transformer, "
+                "patch_transformer, inverted_transformer, tcn, mlp.".format(backbone)
             )
 
     def forward(self, x):
-        # x: [B, L, C].
         if self.backbone == "temporal_transformer":
             h = self.value_proj(x) + self.position(x.size(1)).to(x.device)
-            h = self.encoder(h)  # [B, L, D]
-            return h.mean(dim=1)  # [B, D]
+            return self.pool(self.encoder(h))
 
         if self.backbone == "patch_transformer":
             B, L, C = x.shape
-            pad_len = (self.patch_len - L % self.patch_len) % self.patch_len
-            if pad_len > 0:
-                # Pad on the right so reshape below forms complete non-overlapping patches.
-                x = F.pad(x, (0, 0, 0, pad_len))
-            # [B, L_pad, C] -> [B, P, patch_len, C] -> [B, P, patch_len*C].
-            patches = x.reshape(B, -1, self.patch_len, C).flatten(start_dim=2)
+            if L < self.patch_len:
+                x = F.pad(x, (0, 0, 0, self.patch_len - L))
+                L = x.size(1)
+            remainder = (L - self.patch_len) % self.patch_stride
+            if remainder != 0:
+                x = F.pad(x, (0, 0, 0, self.patch_stride - remainder))
+            patches = x.permute(0, 2, 1).unfold(dimension=-1, size=self.patch_len, step=self.patch_stride)
+            patches = patches.permute(0, 2, 1, 3).flatten(start_dim=2)
             h = self.patch_proj(patches) + self.position(patches.size(1)).to(x.device)
-            h = self.encoder(h)  # [B, P, D]
-            return h.mean(dim=1)  # [B, D]
+            return self.pool(self.encoder(h))
 
         if self.backbone == "inverted_transformer":
-            # [B, L, C] -> [B, C, L], then variables are treated as tokens.
             h = self.value_proj(x.permute(0, 2, 1)) + self.var_embedding
-            h = self.encoder(h)  # [B, C, D]
-            return h.mean(dim=1)  # [B, D]
+            return self.pool(self.encoder(h))
 
         if self.backbone == "tcn":
-            # Conv1d expects [B, C, L]; crop to original length after dilated padding.
             h = self.net(x.permute(0, 2, 1))
-            h = h[..., : x.size(1)].permute(0, 2, 1)  # [B, L, D]
-            return self.norm(h.mean(dim=1))  # [B, D]
+            h = h[..., : x.size(1)].permute(0, 2, 1)
+            return self.norm(h.mean(dim=1))
 
-        return self.net(x)  # [B, D]
+        return self.net(x)
 
 
-def _make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout):
-    encoder_layer = nn.TransformerEncoderLayer(
+class LatentStateEncoder(nn.Module):
+    """
+    Encodes a window into z_i^0. The normalized projection is used as the
+    memory key, while the unnormalized state is kept for decoding.
+    state = s_i: 用于 decoder / rollout / trajectory construction
+    key   = k_i: 用于 memory retrieval
+    """
+    def __init__(self, c_in, seq_len, latent_dim, dropout):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv1d(c_in, latent_dim, kernel_size=8, stride=4, padding=2),
+            nn.GELU(),
+            nn.Conv1d(latent_dim, latent_dim, kernel_size=4, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv1d(latent_dim, latent_dim, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, latent_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(latent_dim),   # state 尺度稳定
+        )
+        self.key_head = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, latent_dim),
+        )
+
+    def forward(self, x):
+        # x: (B, seq_len, c_in)
+        x = x.permute(0, 2, 1).contiguous()
+        state = self.head(self.encoder(x))
+        key = F.normalize(self.key_head(state), dim=-1)
+        return state, key
+
+
+class MemoryBranchDecoder(nn.Module):
+    def __init__(self, latent_dim, num_horizons, pred_len, c_out, hidden_dim, dropout):
+        super().__init__()
+        in_dim = latent_dim * (num_horizons + 1)
+        self.pred_len = pred_len
+        self.c_out = c_out
+        self.input = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden_dim),
+        )
+        self.blocks = nn.Sequential(
+            PreNormMLP(hidden_dim, hidden_dim * 2, dropout),
+            PreNormMLP(hidden_dim, hidden_dim * 2, dropout),
+        )
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out = nn.Linear(hidden_dim, pred_len * c_out)
+
+    def forward(self, state, prototypes):
+        B, M, S, Z = prototypes.shape
+        state_ctx = state.unsqueeze(1).expand(B, M, Z)
+        future_states = state_ctx.unsqueeze(2) + prototypes
+        x = torch.cat([state_ctx, future_states.flatten(start_dim=2)], dim=-1)
+        h = self.blocks(self.input(x))
+        y = self.out(self.out_norm(h))
+        return y.view(B, M, self.pred_len, self.c_out)
+
+
+def make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout):
+    layer = nn.TransformerEncoderLayer(
         d_model=d_model,
         nhead=n_heads,
         dim_feedforward=d_ff,
@@ -171,83 +222,12 @@ def _make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout):
         batch_first=True,
         norm_first=True,
     )
-    return nn.TransformerEncoder(encoder_layer, num_layers=e_layers)
-
-
-class FutureTrajectoryEncoder(nn.Module):
-    """
-    Encodes the future horizon as latent states and a compact dynamics code.
-    The dynamics code is used for offline future branch discovery.
-    """
-
-    def __init__(self, c_in, d_model, n_heads, d_ff, e_layers, dropout, latent_dim):
-        super().__init__()
-        self.value_proj = nn.Linear(c_in, d_model)
-        self.position = SinusoidalPosition(d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_ff,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=max(1, e_layers // 2))
-        self.step_head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, latent_dim),
-        )
-        self.traj_head = nn.Sequential(
-            nn.LayerNorm(latent_dim),
-            nn.Linear(latent_dim, latent_dim),
-            nn.GELU(),
-            nn.Linear(latent_dim, latent_dim),
-        )
-
-    def forward(self, future_y, state):
-        # future_y: [B, H, C], state: [B, Z].
-        h = self.value_proj(future_y) + self.position(future_y.size(1)).to(future_y.device)
-        h = self.encoder(h)  # [B, H, D]
-        future_states = self.step_head(h)  # [B, H, Z]
-
-        # Delta trajectory anchors the future evolution at the current world state.
-        delta = future_states - state.unsqueeze(1)  # [B, H, Z]
-        traj_code = self.traj_head(delta.mean(dim=1))  # [B, Z]
-        return future_states, traj_code
-
-
-class BranchConditionedRollout(nn.Module):
-    """Recurrent latent transition f(z, r) conditioned on one branch prior."""
-
-    def __init__(self, latent_dim, dropout):
-        super().__init__()
-        self.transition = nn.Sequential(
-            nn.Linear(latent_dim * 2, latent_dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(latent_dim * 2, latent_dim),
-        )
-        self.norm = nn.LayerNorm(latent_dim)
-
-    def forward(self, state, branch_cond, horizon):
-        # state: [B, Z], branch_cond: [B, K, Z].
-        B, K, Z = branch_cond.shape
-        cur = state.unsqueeze(1).expand(B, K, Z)  # [B, K, Z], one latent per branch.
-        steps = []
-        for _ in range(horizon):
-            trans_in = torch.cat([cur, branch_cond], dim=-1)  # [B, K, 2Z]
-            delta = self.transition(trans_in)  # [B, K, Z]
-            cur = self.norm(cur + delta)
-            steps.append(cur)
-        return torch.stack(steps, dim=2)  # [B, K, H, Z]
+    return nn.TransformerEncoder(layer, num_layers=max(1, e_layers))
 
 
 def kmeans_torch(x, num_clusters, num_iters=8):
-    """
-    Small deterministic k-means used during offline branch discovery.
-    x: [N, Z], returns centers [M, Z] and assignments [N].
-    """
+    if x.size(0) == 0:
+        raise ValueError("kmeans_torch received an empty tensor.")
     if x.size(0) <= num_clusters:
         pad = num_clusters - x.size(0)
         centers = x
@@ -259,8 +239,8 @@ def kmeans_torch(x, num_clusters, num_iters=8):
     init_ids = torch.linspace(0, x.size(0) - 1, steps=num_clusters, device=x.device).long()
     centers = x[init_ids].clone()
     assign = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-    for _ in range(num_iters):
-        dist = torch.cdist(x, centers, p=2)  # [N, M]
+    for _ in range(max(1, num_iters)):
+        dist = torch.cdist(x, centers, p=2)
         assign = dist.argmin(dim=1)
         new_centers = []
         for cluster_id in range(num_clusters):

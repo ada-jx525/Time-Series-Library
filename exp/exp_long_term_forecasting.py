@@ -4,6 +4,7 @@ from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 from torch import optim
 import os
 import time
@@ -17,21 +18,51 @@ warnings.filterwarnings('ignore')
 
 class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
+        if getattr(args, 'model', None) == 'BranchWorldModel':
+            setattr(args, 'return_index', True)
         super(Exp_Long_Term_Forecast, self).__init__(args)
 
     def _model_core(self):
         return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
-    def _maybe_build_memory(self, train_loader):
-        model_core = self._model_core()
-        if hasattr(model_core, 'build_memory'):
-            print('>>>>>>>building offline branch memory<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<')
-            model_core.build_memory(train_loader, self.device)
+    def _unpack_batch(self, batch):
+        if len(batch) == 5:
+            batch_x, batch_y, batch_x_mark, batch_y_mark, batch_index = batch
+            return batch_x, batch_y, batch_x_mark, batch_y_mark, batch_index
+        batch_x, batch_y, batch_x_mark, batch_y_mark = batch
+        return batch_x, batch_y, batch_x_mark, batch_y_mark, None
 
-    def _forward_model(self, batch_x, batch_x_mark, dec_inp, batch_y_mark, future_y=None):
+    def _maybe_build_memory(self, train_loader, reason='refresh'):
+        model_core = self._model_core()
+        if hasattr(model_core, 'build_memory') and bool(getattr(model_core, 'use_memory', True)):
+            print('>>>>>>>building world-trajectory memory ({})<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(reason))
+            memory_loader = DataLoader(
+                train_loader.dataset,
+                batch_size=train_loader.batch_size,
+                shuffle=False,
+                num_workers=0,
+                drop_last=False,
+            )
+            model_core.build_memory(memory_loader, self.device)
+
+    def _should_refresh_memory(self, epoch):
+        model_core = self._model_core()
+        if not hasattr(model_core, 'build_memory'):
+            return False
+        if not bool(getattr(model_core, 'use_memory', False)):
+            return False
+        warmup_epochs = max(0, getattr(self.args, 'wm_memory_warmup_epochs', 0))
+        if epoch < warmup_epochs:
+            return False
+        update_freq = getattr(self.args, 'wm_memory_update_freq', 1)
+        if update_freq <= 0:
+            return epoch == warmup_epochs
+        return (epoch - warmup_epochs) % update_freq == 0
+
+    def _forward_model(self, batch_x, batch_x_mark, dec_inp, batch_y_mark, future_y=None, query_index=None):
         model_core = self._model_core()
         if future_y is not None and hasattr(model_core, 'get_auxiliary_loss'):
-            return self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, future_y=future_y)
+            return self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, future_y=future_y, query_index=query_index)
         return self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
     def _auxiliary_loss(self):
@@ -39,6 +70,21 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if hasattr(model_core, 'get_auxiliary_loss'):
             return model_core.get_auxiliary_loss()
         return None
+
+    def _branchworld_extra_loss(self, outputs, targets):
+        if self.args.model != 'BranchWorldModel':
+            return outputs.new_tensor(0.0)
+        extra = outputs.new_tensor(0.0)
+        mae_weight = getattr(self.args, 'wm_mae_weight', 0.0)
+        if mae_weight > 0:
+            extra = extra + mae_weight * torch.mean(torch.abs(outputs - targets))
+        freq_weight = getattr(self.args, 'wm_freq_loss_weight', 0.0)
+        if freq_weight > 0:
+            pred_freq = torch.fft.rfft(outputs, dim=1)
+            true_freq = torch.fft.rfft(targets, dim=1)
+            freq_loss = torch.mean(torch.abs(pred_freq - true_freq))
+            extra = extra + freq_weight * freq_loss
+        return extra
 
     def _build_model(self):
         model = self.model_dict[self.args.model](self.args).float()
@@ -64,7 +110,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         total_loss = []
         self.model.eval()
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
+            for i, batch in enumerate(vali_loader):
+                batch_x, batch_y, batch_x_mark, batch_y_mark, _ = self._unpack_batch(batch)
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float()
 
@@ -98,7 +145,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
-        self._maybe_build_memory(train_loader)
 
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
@@ -116,18 +162,24 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             scaler = torch.cuda.amp.GradScaler()
 
         for epoch in range(self.args.train_epochs):
+            if self._should_refresh_memory(epoch):
+                self._maybe_build_memory(train_loader, reason='epoch {}'.format(epoch + 1))
+
             iter_count = 0
             train_loss = []
 
             self.model.train()
             epoch_time = time.time()
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+            for i, batch in enumerate(train_loader):
+                batch_x, batch_y, batch_x_mark, batch_y_mark, batch_index = self._unpack_batch(batch)
                 iter_count += 1
                 model_optim.zero_grad()
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
+                if batch_index is not None:
+                    batch_index = batch_index.to(self.device)
 
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
@@ -137,23 +189,31 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 future_y = batch_y[:, -self.args.pred_len:, :].detach()
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        outputs = self._forward_model(batch_x, batch_x_mark, dec_inp, batch_y_mark, future_y=future_y)
+                        outputs = self._forward_model(
+                            batch_x, batch_x_mark, dec_inp, batch_y_mark,
+                            future_y=future_y, query_index=batch_index,
+                        )
 
                         f_dim = -1 if self.args.features == 'MS' else 0
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
+                        loss = loss + self._branchworld_extra_loss(outputs, batch_y)
                         aux_loss = self._auxiliary_loss()
                         if aux_loss is not None:
                             loss = loss + aux_loss
                         train_loss.append(loss.item())
                 else:
-                    outputs = self._forward_model(batch_x, batch_x_mark, dec_inp, batch_y_mark, future_y=future_y)
+                    outputs = self._forward_model(
+                        batch_x, batch_x_mark, dec_inp, batch_y_mark,
+                        future_y=future_y, query_index=batch_index,
+                    )
 
                     f_dim = -1 if self.args.features == 'MS' else 0
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = criterion(outputs, batch_y)
+                    loss = loss + self._branchworld_extra_loss(outputs, batch_y)
                     aux_loss = self._auxiliary_loss()
                     if aux_loss is not None:
                         loss = loss + aux_loss
@@ -191,6 +251,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
+        self._maybe_build_memory(train_loader, reason='best checkpoint')
 
         return self.model
 
@@ -199,6 +260,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if test:
             print('loading model')
             self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
+            _, train_loader = self._get_data(flag='train')
+            self._maybe_build_memory(train_loader, reason='loaded checkpoint')
 
         preds = []
         trues = []
@@ -208,7 +271,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         self.model.eval()
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+            for i, batch in enumerate(test_loader):
+                batch_x, batch_y, batch_x_mark, batch_y_mark, _ = self._unpack_batch(batch)
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
 

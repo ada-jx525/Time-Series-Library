@@ -1,4 +1,4 @@
-# BranchWorld long-term forecasting dependencies.
+# Time-Series-Library long-term forecasting dependencies.
 # Install PyTorch separately for your CUDA version, then install this file.
 
 numpy==1.26.4

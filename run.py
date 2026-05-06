@@ -12,7 +12,7 @@ if __name__ == '__main__':
     torch.manual_seed(fix_seed)
     np.random.seed(fix_seed)
 
-    parser = argparse.ArgumentParser(description='BranchWorld long-term forecasting')
+    parser = argparse.ArgumentParser(description='Time-Series-Library long-term forecasting')
 
     # basic config
     parser.add_argument('--task_name', type=str, required=True, default='long_term_forecast',
@@ -156,44 +156,56 @@ if __name__ == '__main__':
     parser.add_argument('--top_p', type=float, default=0.5, help='Dynamic Routing in MoE')
     parser.add_argument('--pos', type=int, choices=[0, 1], default=1, help='Positional Embedding. Set pos to 0 or 1')
 
-    # BranchWorldModel: retrieval-conditioned latent world model
+    # BranchWorldModel: world-trajectory memory enhancement module
     parser.add_argument('--wm_latent_dim', type=int, default=256,
-                        help='BranchWorld latent state dimension')
-    parser.add_argument('--wm_branch_num', type=int, default=4,
-                        help='number of future branch prototypes discovered per local neighborhood')
-    parser.add_argument('--wm_retrieve_k', type=int, default=4,
-                        help='number of branch prototypes retrieved for rollout')
-    parser.add_argument('--wm_neighbor_k', type=int, default=64,
-                        help='state-neighborhood size used during offline branch discovery')
-    parser.add_argument('--wm_memory_size', type=int, default=2048,
-                        help='maximum number of training windows/prototypes used in BranchWorld memory')
+                        help='latent state dimension for trajectory memory')
+    parser.add_argument('--wm_branch_num', type=int, default=3,
+                        help='number of future trajectory prototypes discovered per query')
+    parser.add_argument('--wm_retrieve_k', type=int, default=64,
+                        help='TopK state-neighbor count retrieved from memory')
+    parser.add_argument('--wm_memory_size', type=int, default=4096,
+                        help='maximum number of training windows stored in memory')
     parser.add_argument('--wm_kmeans_iters', type=int, default=8,
-                        help='k-means iterations for offline future branch discovery')
-    parser.add_argument('--wm_aux_weight', type=float, default=0.1,
-                        help='latent rollout consistency loss weight')
-    parser.add_argument('--wm_oracle_weight', type=float, default=0.1,
-                        help='oracle branch forecast loss weight')
-    parser.add_argument('--wm_diversity_weight', type=float, default=0.02,
-                        help='branch diversity regularization weight')
+                        help='k-means iterations for query-local trajectory clustering')
+    parser.add_argument('--wm_proto_refine_iters', type=int, default=2,
+                        help='reliability-weighted prototype refinement iterations')
+    parser.add_argument('--wm_proto_state_alpha', type=float, default=1.0,
+                        help='state-similarity exponent in reliability weighting')
+    parser.add_argument('--wm_proto_traj_beta', type=float, default=2.0,
+                        help='trajectory-compactness exponent in reliability weighting')
+    parser.add_argument('--wm_horizons', type=int, nargs='*', default=None,
+                        help='future checkpoints for latent displacement memory; default: H/4 H/2 3H/4 H')
     parser.add_argument('--wm_use_memory', type=int, choices=[0, 1], default=1,
-                        help='use offline branch memory; 0 falls back to learned branch priors')
+                        help='use trajectory memory; 0 uses only zero-memory prototypes plus base expert')
     parser.add_argument('--wm_use_branch_discovery', type=int, choices=[0, 1], default=1,
-                        help='1 clusters local futures into prototypes; 0 stores raw trajectory codes')
-    parser.add_argument('--wm_use_gating', type=int, choices=[0, 1], default=1,
-                        help='use learned branch selector; 0 uses retrieval-similarity weights')
-    parser.add_argument('--wm_use_aux_losses', type=int, choices=[0, 1], default=1,
-                        help='use latent consistency/oracle/diversity auxiliary losses')
-    parser.add_argument('--wm_head_type', type=str, choices=['shared', 'moe'], default='moe',
-                        help='forecast head type: shared decoder with gating, or branch-specialized MoE head')
-    parser.add_argument('--wm_balance_weight', type=float, default=0.01,
-                        help='load-balancing regularization weight for BranchWorld MoE router')
+                        help='1 clusters retrieved trajectories into prototypes; 0 uses selected raw trajectories')
     parser.add_argument('--wm_backbone', type=str, default='patch_transformer',
                         choices=['temporal_transformer', 'patch_transformer', 'inverted_transformer', 'tcn', 'mlp'],
-                        help='state encoder backbone for BranchWorldModel')
+                        help='latent state encoder backbone')
     parser.add_argument('--wm_patch_len', type=int, default=16,
-                        help='patch length for BranchWorld patch_transformer backbone')
-    parser.add_argument('--wm_freeze_backbone', type=int, choices=[0, 1], default=1,
-                        help='freeze BranchWorld state backbone; default 1 trains the memory reasoning head')
+                        help='patch length for patch_transformer state encoder')
+    parser.add_argument('--wm_patch_stride', type=int, default=8,
+                        help='sliding patch stride for patch_transformer state encoder')
+    parser.add_argument('--wm_memory_update_freq', type=int, default=1,
+                        help='refresh memory every N epochs; 0 builds once after warmup')
+    parser.add_argument('--wm_memory_warmup_epochs', type=int, default=0,
+                        help='initial epochs trained before memory refresh starts')
+    parser.add_argument('--wm_base_type', type=str, choices=['linear', 'dlinear'], default='dlinear',
+                        help='lightweight base forecaster used as y_base')
+    parser.add_argument('--wm_freeze_base', type=int, choices=[0, 1], default=1,
+                        help='freeze y_base forecaster while training memory module')
+    parser.add_argument('--wm_mem_loss_type', type=str, choices=['min', 'all', 'weighted'], default='min',
+                        help='memory branch auxiliary loss: min-over-branches, all branches, or gate-weighted')
+    parser.add_argument('--wm_mem_weight', type=float, default=0.1,
+                        help='weighted memory branch auxiliary loss')
+    parser.add_argument('--wm_traj_weight', type=float, default=0.0,
+                        help='optional trajectory consistency loss weight')
+    parser.add_argument('--wm_base_weight', type=float, default=0.0,
+                        help='optional auxiliary loss on y_base')
+    parser.add_argument('--wm_mae_weight', type=float, default=0.0,
+                        help='optional MAE term added to final prediction loss')
+    parser.add_argument('--wm_freq_loss_weight', type=float, default=0.0,
+                        help='optional frequency-domain loss weight for final prediction')
 
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:

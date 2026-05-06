@@ -2,23 +2,67 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from layers.BranchWorld import (
-    BranchAwareLatentStateEncoder,
-    BranchConditionedRollout,
-    FutureTrajectoryEncoder,
-    kmeans_torch,
-)
+from layers.Autoformer_EncDec import series_decomp
+from layers.BranchWorld import LatentStateEncoder, MemoryBranchDecoder, kmeans_torch
+
+
+class DLinearBase(nn.Module):
+    def __init__(self, seq_len, pred_len, channels, moving_avg, individual=False):
+        super().__init__()
+        self.pred_len = pred_len
+        self.channels = channels
+        self.individual = individual
+        self.decomposition = series_decomp(moving_avg)
+        if individual:
+            self.linear_seasonal = nn.ModuleList([nn.Linear(seq_len, pred_len) for _ in range(channels)])
+            self.linear_trend = nn.ModuleList([nn.Linear(seq_len, pred_len) for _ in range(channels)])
+            for seasonal, trend in zip(self.linear_seasonal, self.linear_trend):
+                nn.init.constant_(seasonal.weight, 1.0 / seq_len)
+                nn.init.constant_(trend.weight, 1.0 / seq_len)
+        else:
+            self.linear_seasonal = nn.Linear(seq_len, pred_len)
+            self.linear_trend = nn.Linear(seq_len, pred_len)
+            nn.init.constant_(self.linear_seasonal.weight, 1.0 / seq_len)
+            nn.init.constant_(self.linear_trend.weight, 1.0 / seq_len)
+
+    def forward(self, x):
+        seasonal, trend = self.decomposition(x)
+        seasonal = seasonal.permute(0, 2, 1)
+        trend = trend.permute(0, 2, 1)
+        if self.individual:
+            seasonal_out = torch.zeros(
+                seasonal.size(0), seasonal.size(1), self.pred_len,
+                dtype=seasonal.dtype,
+                device=seasonal.device,
+            )
+            trend_out = torch.zeros_like(seasonal_out)
+            for channel in range(self.channels):
+                seasonal_out[:, channel] = self.linear_seasonal[channel](seasonal[:, channel])
+                trend_out[:, channel] = self.linear_trend[channel](trend[:, channel])
+        else:
+            seasonal_out = self.linear_seasonal(seasonal)
+            trend_out = self.linear_trend(trend)
+        return (seasonal_out + trend_out).permute(0, 2, 1)
+
+
+class LinearBase(nn.Module):
+    def __init__(self, seq_len, pred_len, channels):
+        super().__init__()
+        self.proj = nn.Linear(seq_len, pred_len)
+        nn.init.constant_(self.proj.weight, 1.0 / seq_len)
+
+    def forward(self, x):
+        return self.proj(x.permute(0, 2, 1)).permute(0, 2, 1)
 
 
 class Model(nn.Module):
     """
-    BranchWorldModel: branch-aware latent world model for time-series forecasting.
+    World-Trajectory Memory Enhancement Module.
 
-    The model follows four explicit modules:
-    1. Branch-aware latent state encoder.
-    2. Offline future branch discovery and prototype memory.
-    3. Retrieval-conditioned multi-branch latent rollout.
-    4. Branch selection / mixture head.
+    This is a memory-enhanced forecaster, not an end-to-end latent world model.
+    It keeps a base forecast, retrieves historical states by z_i^0, discovers
+    multi-horizon latent displacement prototypes, decodes memory branches, and
+    learns a base-vs-memory fusion gate.
     """
 
     def __init__(self, configs):
@@ -26,122 +70,146 @@ class Model(nn.Module):
         self.task_name = configs.task_name
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
-        self.c_out = configs.c_out
         self.enc_in = configs.enc_in
-
+        self.c_out = configs.c_out
         self.latent_dim = getattr(configs, "wm_latent_dim", configs.d_model)
-        self.branch_num = getattr(configs, "wm_branch_num", 4)
-        self.retrieve_k = getattr(configs, "wm_retrieve_k", self.branch_num)
-        self.neighbor_k = getattr(configs, "wm_neighbor_k", 64)
-        self.memory_size = getattr(configs, "wm_memory_size", 2048)
+        self.branch_num = getattr(configs, "wm_branch_num", 3)
+        self.retrieve_k = getattr(configs, "wm_retrieve_k", 64)
+        self.memory_size = getattr(configs, "wm_memory_size", 4096)
         self.kmeans_iters = getattr(configs, "wm_kmeans_iters", 8)
-        self.aux_weight = getattr(configs, "wm_aux_weight", 0.1)
-        self.diversity_weight = getattr(configs, "wm_diversity_weight", 0.02)
-        self.oracle_weight = getattr(configs, "wm_oracle_weight", 0.1)
+        self.prototype_refine_iters = getattr(configs, "wm_proto_refine_iters", 2)
+        self.proto_state_alpha = getattr(configs, "wm_proto_state_alpha", 1.0)
+        self.proto_traj_beta = getattr(configs, "wm_proto_traj_beta", 2.0)
         self.use_memory = bool(getattr(configs, "wm_use_memory", 1))
         self.use_branch_discovery = bool(getattr(configs, "wm_use_branch_discovery", 1))
-        self.use_gating = bool(getattr(configs, "wm_use_gating", 1))
-        self.use_aux_losses = bool(getattr(configs, "wm_use_aux_losses", 1))
-        self.head_type = getattr(configs, "wm_head_type", "moe")
-        self.balance_weight = getattr(configs, "wm_balance_weight", 0.01)
-        self.backbone_name = getattr(configs, "wm_backbone", "patch_transformer")
-        self.freeze_backbone = bool(getattr(configs, "wm_freeze_backbone", 0))
+        self.mem_weight = getattr(configs, "wm_mem_weight", 0.1)
+        self.traj_weight = getattr(configs, "wm_traj_weight", 0.0)
+        self.base_weight = getattr(configs, "wm_base_weight", 0.0)
+        self.base_type = getattr(configs, "wm_base_type", "dlinear")
+        self.mem_loss_type = getattr(configs, "wm_mem_loss_type", "min")
+        self.freeze_base = bool(getattr(configs, "wm_freeze_base", 1))
 
-        self.state_encoder = BranchAwareLatentStateEncoder(
+        horizons = getattr(configs, "wm_horizons", None)
+        if horizons is None or len(horizons) == 0:
+            horizons = [max(1, self.pred_len // 4), max(1, self.pred_len // 2), max(1, 3 * self.pred_len // 4), self.pred_len]
+        self.horizons = sorted(set(int(h) for h in horizons if int(h) > 0 and int(h) <= self.pred_len))
+        if not self.horizons:
+            self.horizons = [self.pred_len]
+        self.num_horizons = len(self.horizons)
+
+        if self.base_type == "linear":
+            self.base_forecaster = LinearBase(self.seq_len, self.pred_len, self.c_out)
+        else:
+            self.base_forecaster = DLinearBase(
+                self.seq_len,
+                self.pred_len,
+                self.c_out,
+                getattr(configs, "moving_avg", 25),
+                bool(getattr(configs, "individual", False)),
+            )
+        if self.freeze_base:
+            for param in self.base_forecaster.parameters():
+                param.requires_grad = False
+
+        self.state_encoder = LatentStateEncoder(
             c_in=configs.enc_in,
             seq_len=configs.seq_len,
-            d_model=configs.d_model,
-            n_heads=configs.n_heads,
-            d_ff=configs.d_ff,
-            e_layers=configs.e_layers,
-            dropout=configs.dropout,
-            latent_dim=self.latent_dim,
-            backbone=self.backbone_name,
-            patch_len=getattr(configs, "wm_patch_len", getattr(configs, "patch_len", 16)),
-            freeze_backbone=self.freeze_backbone,
-        )
-        self.future_encoder = FutureTrajectoryEncoder(
-            c_in=configs.c_out,
-            d_model=configs.d_model,
-            n_heads=configs.n_heads,
-            d_ff=configs.d_ff,
-            e_layers=configs.e_layers,
             dropout=configs.dropout,
             latent_dim=self.latent_dim,
         )
-
-        self.branch_fuser = nn.Sequential(
-            nn.Linear(self.latent_dim * 2 + 1, self.latent_dim),
-            nn.GELU(),
-            nn.Dropout(configs.dropout),
-            nn.Linear(self.latent_dim, self.latent_dim),
+        self.memory_decoder = MemoryBranchDecoder(
+            latent_dim=self.latent_dim,
+            num_horizons=self.num_horizons,
+            pred_len=self.pred_len,
+            c_out=self.c_out,
+            hidden_dim=configs.d_ff,
+            dropout=configs.dropout,
         )
-        self.rollout = BranchConditionedRollout(self.latent_dim, configs.dropout)
-        self.decoder = nn.Sequential(
-            nn.LayerNorm(self.latent_dim),
-            nn.Linear(self.latent_dim, configs.d_ff),
-            nn.GELU(),
-            nn.Dropout(configs.dropout),
-            nn.Linear(configs.d_ff, configs.c_out),
-        )
-        self.expert_decoders = nn.ModuleList([
-            nn.Sequential(
-                nn.LayerNorm(self.latent_dim),
-                nn.Linear(self.latent_dim, configs.d_ff),
-                nn.GELU(),
-                nn.Dropout(configs.dropout),
-                nn.Linear(configs.d_ff, configs.c_out),
-            )
-            for _ in range(self.branch_num)
-        ])
         self.gate = nn.Sequential(
-            nn.Linear(self.latent_dim * 3 + 1, self.latent_dim),
+            nn.LayerNorm(self.latent_dim + self.num_horizons * self.latent_dim + 4),
+            nn.Linear(self.latent_dim + self.num_horizons * self.latent_dim + 4, configs.d_ff),
             nn.GELU(),
-            nn.Linear(self.latent_dim, 1),
+            nn.Dropout(configs.dropout),
+            nn.Linear(configs.d_ff, 1),
         )
-
-        self.fallback_branches = nn.Parameter(torch.randn(self.branch_num, self.latent_dim) * 0.02)
+        self.base_gate = nn.Sequential(
+            nn.LayerNorm(self.latent_dim + 4),
+            nn.Linear(self.latent_dim + 4, configs.d_ff),
+            nn.GELU(),
+            nn.Dropout(configs.dropout),
+            nn.Linear(configs.d_ff, 1),
+        )
+        self.traj_head = nn.Sequential(
+            nn.LayerNorm(self.pred_len * self.c_out),
+            nn.Linear(self.pred_len * self.c_out, configs.d_ff),
+            nn.GELU(),
+            nn.Linear(configs.d_ff, self.num_horizons * self.latent_dim),
+        )
         self._last_aux_loss = None
 
-        self.register_buffer("memory_centers", torch.empty(0, self.latent_dim), persistent=False)
-        self.register_buffer("memory_branches", torch.empty(0, self.latent_dim), persistent=False)
+        self.register_buffer("memory_keys", torch.empty(0, self.latent_dim), persistent=False)
+        self.register_buffer("memory_states", torch.empty(0, self.latent_dim), persistent=False)
+        self.register_buffer("memory_trajectories", torch.empty(0, self.num_horizons, self.latent_dim), persistent=False)
+        # Future evolution patterns in each memory item's local normalized
+        # coordinates. These are branch targets for D_theta(z_q, P_m); they
+        # are denormalized with the query window statistics only at output time.
+        self.register_buffer("memory_values", torch.empty(0, self.pred_len, self.c_out), persistent=False)
+        self.register_buffer("memory_indices", torch.empty(0, dtype=torch.long), persistent=False)
         self.register_buffer("memory_ready", torch.tensor(False), persistent=False)
 
     def _normalize(self, x):
-        # x: [B, L, C]. Statistics are detached as in common long-term forecasting baselines.
         means = x.mean(1, keepdim=True).detach()
         x = x - means
         stdev = torch.sqrt(torch.var(x, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
-        x = x / stdev
-        return x, means, stdev
+        return x / stdev, means, stdev
 
     def _denormalize(self, y, means, stdev):
-        # y: [B, H, C_out]. The ETT-style benchmarks usually have C_out == enc_in.
         if means.size(-1) != y.size(-1):
             means = means[..., -y.size(-1):]
             stdev = stdev[..., -y.size(-1):]
         return y * stdev[:, 0, :].unsqueeze(1) + means[:, 0, :].unsqueeze(1)
 
+    def _base_forecast(self, norm_x):
+        return self.base_forecaster(norm_x[:, :, -self.c_out:])
+
+    def _shifted_windows(self, norm_x, norm_future):
+        series = torch.cat([norm_x, norm_future], dim=1)
+        windows = []
+        for horizon in self.horizons:
+            windows.append(series[:, horizon : horizon + self.seq_len])
+        return windows
+
+    def _encode_trajectory(self, norm_x, norm_future):
+        state, key = self.state_encoder(norm_x)
+        future_states = []
+        for future_window in self._shifted_windows(norm_x, norm_future):
+            future_state, _ = self.state_encoder(future_window)
+            future_states.append(future_state)
+        trajectory = torch.stack(future_states, dim=1) - state.unsqueeze(1)
+        return state, key, trajectory
+
     @torch.no_grad()
     def build_memory(self, data_loader, device):
-        """
-        Offline future branch discovery.
-
-        For each training sample, encode current state z_i and future dynamics u_i.
-        Then each anchor state builds a local neighborhood and compresses the
-        neighborhood's future dynamics into branch prototypes by k-means.
-        """
         if not self.use_memory or self.memory_size <= 0:
             self.memory_ready.fill_(False)
             return
 
         was_training = self.training
         self.eval()
-
         states = []
-        retrieval_states = []
-        traj_codes = []
-        for batch_x, batch_y, _, _ in data_loader:
+        keys = []
+        trajectories = []
+        values = []
+        source_indices = []
+        offset = 0
+
+        for batch in data_loader:
+            if len(batch) == 5:
+                batch_x, batch_y, _, _, batch_index = batch
+            else:
+                batch_x, batch_y, _, _ = batch
+                batch_index = torch.arange(offset, offset + batch_x.size(0))
+            offset += batch_x.size(0)
             batch_x = batch_x.float().to(device)
             future_y = batch_y[:, -self.pred_len:, :].float().to(device)
             if future_y.size(-1) != self.c_out:
@@ -149,157 +217,191 @@ class Model(nn.Module):
 
             norm_x, means, stdev = self._normalize(batch_x)
             norm_future = (future_y - means[:, :, -future_y.size(-1):]) / stdev[:, :, -future_y.size(-1):]
-
-            state, retrieval_state = self.state_encoder(norm_x)
-            _, traj_code = self.future_encoder(norm_future, state)
+            state, key, trajectory = self._encode_trajectory(norm_x, norm_future)
             states.append(state.detach().cpu())
-            retrieval_states.append(retrieval_state.detach().cpu())
-            traj_codes.append(F.normalize(traj_code, dim=-1).detach().cpu())
+            keys.append(key.detach().cpu())
+            trajectories.append(trajectory.detach().cpu())
+            values.append(norm_future.detach().cpu())
+            source_indices.append(batch_index.detach().cpu().long())
 
-            if sum(x.size(0) for x in states) >= self.memory_size:
-                break
-
-        if not states:
+        if not keys:
             self.memory_ready.fill_(False)
             if was_training:
                 self.train()
             return
 
-        states = torch.cat(states, dim=0)[: self.memory_size].to(device)
-        retrieval_states = torch.cat(retrieval_states, dim=0)[: self.memory_size].to(device)
-        traj_codes = torch.cat(traj_codes, dim=0)[: self.memory_size].to(device)
+        states = torch.cat(states, dim=0).to(device)
+        keys = torch.cat(keys, dim=0).to(device)
+        trajectories = torch.cat(trajectories, dim=0).to(device)
+        values = torch.cat(values, dim=0).to(device)
+        source_indices = torch.cat(source_indices, dim=0).to(device)
 
-        sim = retrieval_states @ retrieval_states.t()  # [N, N], state-neighborhood similarity.
-        neighbor_k = min(self.neighbor_k, retrieval_states.size(0))
-        _, nn_idx = torch.topk(sim, k=neighbor_k, dim=-1)
+        if keys.size(0) > self.memory_size:
+            ids = torch.linspace(0, keys.size(0) - 1, self.memory_size, device=device).long()
+            states = states[ids]
+            keys = keys[ids]
+            trajectories = trajectories[ids]
+            values = values[ids]
+            source_indices = source_indices[ids]
 
-        if self.use_branch_discovery:
-            centers = []
-            branches = []
-            for anchor_id in range(retrieval_states.size(0)):
-                ids = nn_idx[anchor_id]
-                local_u = traj_codes[ids]  # [neighbor_k, Z], future dynamics around one state.
-                _, assign = kmeans_torch(local_u, self.branch_num, self.kmeans_iters)
-
-                for branch_id in range(self.branch_num):
-                    mask = assign == branch_id
-                    if not mask.any():
-                        continue
-                    local_ids = ids[mask]
-                    centers.append(retrieval_states[local_ids].mean(dim=0))
-                    branches.append(traj_codes[local_ids].mean(dim=0))
-
-            centers = F.normalize(torch.stack(centers, dim=0), dim=-1)
-            branches = F.normalize(torch.stack(branches, dim=0), dim=-1)
-        else:
-            # Raw retrieval ablation: store one future dynamics code per training state.
-            centers = retrieval_states
-            branches = traj_codes
-        if centers.size(0) > self.memory_size:
-            ids = torch.linspace(0, centers.size(0) - 1, self.memory_size, device=device).long()
-            centers = centers[ids]
-            branches = branches[ids]
-
-        self.memory_centers = centers.detach()
-        self.memory_branches = branches.detach()
+        self.memory_states = states.detach()
+        self.memory_keys = F.normalize(keys.detach(), dim=-1)
+        self.memory_trajectories = trajectories.detach()
+        self.memory_values = values.detach()
+        self.memory_indices = source_indices.detach()
         self.memory_ready.fill_(True)
         if was_training:
             self.train()
 
-    def _retrieve(self, retrieval_state):
-        B = retrieval_state.size(0)
-        K = min(self.retrieve_k, max(1, self.memory_centers.size(0)))
+    def _fallback_prototypes(self, state):
+        B = state.size(0)
+        prototypes = state.new_zeros(B, self.branch_num, self.num_horizons, self.latent_dim)
+        reliability = state.new_zeros(B, self.branch_num, 3)
+        return prototypes, reliability
 
-        if bool(self.memory_ready) and self.memory_centers.numel() > 0:
-            sim = retrieval_state @ self.memory_centers.t()  # [B, P]
-            score, idx = torch.topk(sim, k=K, dim=-1)
-            centers = self.memory_centers[idx]  # [B, K, Z]
-            branches = self.memory_branches[idx]  # [B, K, Z]
-            score = score.unsqueeze(-1)  # [B, K, 1]
-        else:
-            K = self.branch_num
-            centers = retrieval_state.unsqueeze(1).expand(B, K, self.latent_dim)
-            branches = F.normalize(self.fallback_branches, dim=-1).unsqueeze(0).expand(B, K, self.latent_dim)
-            score = torch.zeros(B, K, 1, device=retrieval_state.device)
+    def _discover_prototypes(self, query_key, query_index=None):
+        B = query_key.size(0)
+        if not (self.use_memory and bool(self.memory_ready) and self.memory_keys.numel() > 0):
+            prototypes, reliability = self._fallback_prototypes(query_key)
+            return prototypes, reliability, None
 
-        return centers, branches, score
+        retrieve_k = min(self.retrieve_k, self.memory_keys.size(0))
+        # Retrieval and clustering are memory operations, not differentiable
+        # sequence modeling layers. Stop gradients here to avoid unstable
+        # TopK/k-means gradients leaking into the state encoder.
+        query_key = query_key.detach()
+        sim_all = query_key @ self.memory_keys.t()
+        if self.training and query_index is not None and self.memory_indices.numel() == self.memory_keys.size(0):
+            exclusion_radius = self.seq_len + self.pred_len
+            query_index = query_index.to(sim_all.device).long()
+            overlap = (query_index.unsqueeze(1) - self.memory_indices.unsqueeze(0)).abs() < exclusion_radius
+            sim_all = sim_all.masked_fill(overlap, -torch.inf)
+            empty = torch.isneginf(sim_all).all(dim=-1)
+            if empty.any():
+                fallback_sim = query_key[empty] @ self.memory_keys.t()
+                sim_all[empty] = fallback_sim
+        score, idx = torch.topk(sim_all, k=retrieve_k, dim=-1)
+        neighbor_traj = self.memory_trajectories[idx]
+        neighbor_values = self.memory_values[idx]
 
-    def _forecast_normalized(self, x_enc, future_y=None):
+        if not self.use_branch_discovery:
+            order = torch.linspace(0, retrieve_k - 1, steps=self.branch_num, device=query_key.device).long()
+            prototypes = neighbor_traj[:, order]
+            branch_targets = neighbor_values[:, order]
+            state_rel = ((score[:, order] + 1.0) * 0.5).clamp_min(1e-6)
+            traj_rel = prototypes.new_ones(B, self.branch_num)
+            size_rel = prototypes.new_full((B, self.branch_num), 1.0 / max(1, retrieve_k))
+            return prototypes, torch.stack([state_rel, traj_rel, size_rel], dim=-1), branch_targets
+
+        prototypes = []
+        reliabilities = []
+        branch_targets = []
+        flat_dim = self.num_horizons * self.latent_dim
+        for batch_id in range(B):
+            local = neighbor_traj[batch_id]
+            local_values = neighbor_values[batch_id]
+            local_flat = local.reshape(retrieve_k, flat_dim)
+            _, assign = kmeans_torch(local_flat, self.branch_num, self.kmeans_iters)
+            proto_m = []
+            rel_m = []
+            target_m = []
+            for branch_id in range(self.branch_num):
+                mask = assign == branch_id
+                if not mask.any():
+                    best_id = min(branch_id, retrieve_k - 1)
+                    proto = local[best_id]
+                    target = local_values[best_id]
+                    state_rel = ((score[batch_id, best_id] + 1.0) * 0.5).clamp_min(1e-6)
+                    traj_rel = proto.new_tensor(0.0)
+                    size_rel = proto.new_tensor(0.0)
+                else:
+                    member = local[mask]
+                    member_values = local_values[mask]
+                    member_score = score[batch_id, mask]
+                    proto = member.mean(dim=0)
+                    state_rel = ((member_score + 1.0) * 0.5).clamp_min(1e-6)
+                    weight = torch.full_like(state_rel, 1.0 / max(1, state_rel.numel()))
+                    for _ in range(max(1, self.prototype_refine_iters)):
+                        dist = (member - proto.unsqueeze(0)).flatten(start_dim=1).pow(2).sum(dim=-1).sqrt()
+                        traj_rel_vec = torch.exp(-dist)
+                        weight = state_rel.pow(self.proto_state_alpha) * traj_rel_vec.pow(self.proto_traj_beta)
+                        weight = weight / weight.sum().clamp_min(1e-6)
+                        proto = (member * weight.view(-1, 1, 1)).sum(dim=0)
+                    target = (member_values * weight.view(-1, 1, 1)).sum(dim=0)
+                    dist = (member - proto.unsqueeze(0)).flatten(start_dim=1).pow(2).sum(dim=-1).sqrt()
+                    traj_rel_vec = torch.exp(-dist)
+                    state_rel = state_rel.mean()
+                    traj_rel = traj_rel_vec.mean()
+                    size_rel = proto.new_tensor(float(mask.sum().item()) / float(retrieve_k))
+                proto_m.append(proto)
+                rel_m.append(torch.stack([state_rel, traj_rel, size_rel]))
+                target_m.append(target)
+            prototypes.append(torch.stack(proto_m, dim=0))
+            reliabilities.append(torch.stack(rel_m, dim=0))
+            branch_targets.append(torch.stack(target_m, dim=0))
+
+        branch_targets = torch.stack(branch_targets, dim=0)
+        return torch.stack(prototypes, dim=0), torch.stack(reliabilities, dim=0), branch_targets
+
+    def _fusion(self, state, prototypes, reliability, y_base, y_mem):
+        B, M = y_mem.shape[:2]
+        disagreement = (y_mem - y_base.unsqueeze(1)).abs().mean(dim=(2, 3), keepdim=False).unsqueeze(-1)
+        branch_features = torch.cat([reliability, disagreement], dim=-1)
+        gate_in = torch.cat([
+            state.unsqueeze(1).expand(B, M, self.latent_dim),
+            prototypes.flatten(start_dim=2),
+            branch_features,
+        ], dim=-1)
+        mem_logits = self.gate(gate_in).squeeze(-1)
+
+        global_reliability = reliability.mean(dim=1)
+        global_disagreement = disagreement.mean(dim=1)
+        base_features = torch.cat([global_reliability, global_disagreement], dim=-1)
+        base_logit = self.base_gate(torch.cat([state, base_features], dim=-1)).squeeze(-1)
+        weights = torch.softmax(torch.cat([base_logit.unsqueeze(-1), mem_logits], dim=-1), dim=-1)
+        y_hat = weights[:, :1].unsqueeze(-1) * y_base
+        y_hat = y_hat + (weights[:, 1:].unsqueeze(-1).unsqueeze(-1) * y_mem).sum(dim=1)
+        return y_hat, weights
+
+    def _forecast_normalized(self, x_enc, future_y=None, query_index=None):
         norm_x, means, stdev = self._normalize(x_enc)
-        state, retrieval_state = self.state_encoder(norm_x)
-        centers, branches, sim_score = self._retrieve(retrieval_state)
-
-        # Branch condition r^(k): [state prototype, dynamics prototype, retrieval score] -> [B, K, Z].
-        branch_cond = self.branch_fuser(torch.cat([centers, branches, sim_score], dim=-1))
-        latent_paths = self.rollout(state, branch_cond, self.pred_len)  # [B, K, H, Z]
-
-        # Decode each branch independently before mixing, preserving branch-specific futures.
-        if self.head_type == "moe":
-            expert_outputs = []
-            for branch_id in range(latent_paths.size(1)):
-                # latent_paths[:, branch_id]: [B, H, Z] -> expert forecast [B, H, C].
-                expert = self.expert_decoders[branch_id % len(self.expert_decoders)]
-                expert_outputs.append(expert(latent_paths[:, branch_id]))
-            branch_pred = torch.stack(expert_outputs, dim=1)  # [B, K, H, C]
-        else:
-            branch_pred = self.decoder(latent_paths)  # [B, K, H, C]
-
-        gate_state = state.unsqueeze(1).expand_as(branch_cond)
-        gate_in = torch.cat([gate_state, centers, branches, sim_score], dim=-1)  # [B, K, 3Z + 1]
-        if self.use_gating:
-            logits = self.gate(gate_in).squeeze(-1)  # [B, K]
-            weights = torch.softmax(logits, dim=-1)
-        else:
-            weights = torch.softmax(sim_score.squeeze(-1), dim=-1)
-        pred = (branch_pred * weights[:, :, None, None]).sum(dim=1)  # [B, H, C]
+        y_base = self._base_forecast(norm_x)
+        state, key = self.state_encoder(norm_x)
+        prototypes, reliability, branch_targets = self._discover_prototypes(key, query_index=query_index)
+        y_mem = self.memory_decoder(state, prototypes)
+        pred, weights = self._fusion(state, prototypes, reliability, y_base, y_mem)
 
         self._last_aux_loss = None
-        if self.training and self.use_aux_losses and future_y is not None:
+        if self.training and future_y is not None:
             if future_y.size(-1) != self.c_out:
                 future_y = future_y[:, :, -self.c_out:]
             norm_future = (future_y - means[:, :, -future_y.size(-1):]) / stdev[:, :, -future_y.size(-1):]
-            future_states, _ = self.future_encoder(norm_future, state)
-
-            mixed_latent = (latent_paths * weights[:, :, None, None]).sum(dim=1)  # [B, H, Z]
-            latent_loss = F.mse_loss(mixed_latent, future_states.detach())
-
-            branch_error = (branch_pred - norm_future.unsqueeze(1)).pow(2).mean(dim=(2, 3))  # [B, K]
-            oracle_loss = branch_error.min(dim=1).values.mean()
-
-            if branch_pred.size(1) > 1:
-                flat = branch_pred.flatten(start_dim=2)  # [B, K, H*C]
-                pair_dist = torch.cdist(flat, flat, p=2)
-                eye = torch.eye(pair_dist.size(1), device=pair_dist.device).bool().unsqueeze(0)
-                diversity_loss = torch.exp(-pair_dist.masked_fill(eye, 1e6)).mean()
+            mem_target = branch_targets.detach() if branch_targets is not None else norm_future.unsqueeze(1)
+            branch_error = (y_mem - mem_target).pow(2).mean(dim=(2, 3))
+            if self.mem_loss_type == "all":
+                mem_loss = branch_error.mean()
+            elif self.mem_loss_type == "weighted":
+                mem_loss = (weights[:, 1:].detach() * branch_error).sum(dim=1).mean()
             else:
-                diversity_loss = pred.new_tensor(0.0)
-
-            balance_loss = pred.new_tensor(0.0)
-            if self.head_type == "moe" and weights.size(1) > 1:
-                # Encourage the router to use multiple branch experts over a batch.
-                # mean_usage: [K], ideal usage is approximately uniform.
-                mean_usage = weights.mean(dim=0)
-                balance_loss = weights.size(1) * torch.sum(mean_usage * mean_usage)
-
-            self._last_aux_loss = (
-                self.aux_weight * latent_loss
-                + self.oracle_weight * oracle_loss
-                + self.diversity_weight * diversity_loss
-                + self.balance_weight * balance_loss
-            )
+                mem_loss = branch_error.min(dim=1).values.mean()
+            aux_loss = self.mem_weight * mem_loss
+            if self.base_weight > 0:
+                aux_loss = aux_loss + self.base_weight * F.mse_loss(y_base, norm_future)
+            if self.traj_weight > 0:
+                pred_traj = self.traj_head(y_mem.flatten(start_dim=2)).view_as(prototypes)
+                aux_loss = aux_loss + self.traj_weight * F.mse_loss(pred_traj, prototypes.detach())
+            self._last_aux_loss = aux_loss
 
         return pred, means, stdev
 
     def get_auxiliary_loss(self):
-        if self._last_aux_loss is None:
-            return None
         return self._last_aux_loss
 
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, future_y=None):
-        pred, means, stdev = self._forecast_normalized(x_enc, future_y=future_y)
+    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, future_y=None, query_index=None):
+        pred, means, stdev = self._forecast_normalized(x_enc, future_y=future_y, query_index=query_index)
         return self._denormalize(pred, means, stdev)
 
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None, future_y=None):
-        if self.task_name not in ["long_term_forecast"]:
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None, future_y=None, query_index=None):
+        if self.task_name != "long_term_forecast":
             raise NotImplementedError("BranchWorldModel currently supports long_term_forecast.")
-        return self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec, future_y=future_y)
+        return self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec, future_y=future_y, query_index=query_index)
