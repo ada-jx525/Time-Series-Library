@@ -370,68 +370,6 @@ class MemoryBranchDecoder(nn.Module):
         return y.view(B, M, self.pred_len, self.c_out)
 
 
-class SequenceMemoryBranchDecoder(nn.Module):
-    def __init__(
-        self,
-        latent_dim,
-        num_horizons,
-        pred_len,
-        c_out,
-        hidden_dim,
-        dropout,
-        decoder_type="gru",
-        n_heads=4,
-    ):
-        super().__init__()
-        self.pred_len = pred_len
-        self.c_out = c_out
-        self.decoder_type = decoder_type
-        self.input = nn.Sequential(
-            nn.LayerNorm(latent_dim),
-            nn.Linear(latent_dim, hidden_dim),
-        )
-        self.position = SinusoidalPosition(hidden_dim, max_len=num_horizons + 1)
-        if decoder_type == "transformer":
-            self.sequence = make_transformer_encoder(
-                hidden_dim,
-                n_heads=max(1, min(n_heads, hidden_dim)),
-                d_ff=hidden_dim * 2,
-                e_layers=1,
-                dropout=dropout,
-            )
-        else:
-            self.sequence = nn.GRU(
-                hidden_dim,
-                hidden_dim,
-                num_layers=1,
-                batch_first=True,
-                dropout=0.0,
-            )
-        self.pool = AttentionPool(hidden_dim)
-        self.blocks = nn.Sequential(
-            PreNormMLP(hidden_dim, hidden_dim * 2, dropout),
-            PreNormMLP(hidden_dim, hidden_dim * 2, dropout),
-        )
-        self.out_norm = nn.LayerNorm(hidden_dim)
-        self.out = nn.Linear(hidden_dim, pred_len * c_out)
-
-    def forward(self, state, prototypes):
-        B, M, S, Z = prototypes.shape
-        state_ctx = state.unsqueeze(1).expand(B, M, Z)
-        future_states = state_ctx.unsqueeze(2) + prototypes
-        seq = torch.cat([state_ctx.unsqueeze(2), future_states], dim=2)
-        seq = seq.reshape(B * M, S + 1, Z)
-        h = self.input(seq) + self.position(S + 1).to(seq.device)
-        if self.decoder_type == "transformer":
-            h = self.sequence(h)
-        else:
-            h, _ = self.sequence(h)
-        h = self.pool(h).view(B, M, -1)
-        h = self.blocks(h)
-        y = self.out(self.out_norm(h))
-        return y.view(B, M, self.pred_len, self.c_out)
-
-
 def make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout):
     layer = nn.TransformerEncoderLayer(
         d_model=d_model,
@@ -451,6 +389,13 @@ def kmeans_torch(x, num_clusters, num_iters=8, normalize=True, eps=1e-6):
     return:
         centers: (num_clusters, D) in original space
         assign:  (K,)
+    1. 加 separation regularization
+
+    防止多个 branch prototype 太像：
+
+    L_{sep}=\log\sum_{m\neq n}\exp(-\|P_m-P_n\|_2^2/\tau)
+
+    这能让不同 branch 真正代表不同未来
     """
     if x.size(0) == 0:
         raise ValueError("kmeans_torch received an empty tensor.")
