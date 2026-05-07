@@ -165,10 +165,14 @@ if __name__ == '__main__':
                         help='TopK state-neighbor count retrieved from memory')
     parser.add_argument('--wm_memory_size', type=int, default=4096,
                         help='maximum number of training windows stored in memory')
+    parser.add_argument('--wm_global_proto_num', type=int, default=32,
+                        help='number of offline latent dynamics prototypes in the global bank')
+    parser.add_argument('--wm_proto_mode', type=str, choices=['offline', 'local'], default='offline',
+                        help='offline selects from global prototype bank; local uses query-local k-means as ablation')
     parser.add_argument('--wm_kmeans_iters', type=int, default=8,
-                        help='k-means iterations for query-local trajectory clustering')
+                        help='k-means iterations for offline global trajectory prototype learning')
     parser.add_argument('--wm_proto_refine_iters', type=int, default=2,
-                        help='reliability-weighted prototype refinement iterations')
+                        help='reserved iterations for future query-local prototype refinement variant')
     parser.add_argument('--wm_proto_state_alpha', type=float, default=1.0,
                         help='state-similarity exponent in reliability weighting')
     parser.add_argument('--wm_proto_traj_beta', type=float, default=2.0,
@@ -178,7 +182,7 @@ if __name__ == '__main__':
     parser.add_argument('--wm_use_memory', type=int, choices=[0, 1], default=1,
                         help='use trajectory memory; 0 uses only zero-memory prototypes plus base expert')
     parser.add_argument('--wm_use_branch_discovery', type=int, choices=[0, 1], default=1,
-                        help='1 clusters retrieved trajectories into prototypes; 0 uses selected raw trajectories')
+                        help='1 selects branches from offline prototype bank; 0 uses selected raw trajectories')
     parser.add_argument('--wm_backbone', type=str, default='patch_transformer',
                         choices=['temporal_transformer', 'patch_transformer', 'inverted_transformer', 'tcn', 'mlp'],
                         help='latent state encoder backbone')

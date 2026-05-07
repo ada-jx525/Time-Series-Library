@@ -8,7 +8,8 @@ This repository keeps the classic long-term forecasting models and adds
 - encode the current window into latent state `z_i^0`
 - store multi-horizon latent displacement trajectories `T_i`
 - retrieve neighbors by current-state similarity only
-- cluster retrieved trajectories into future trajectory prototypes `P_m`
+- learn an offline global latent dynamics prototype bank from training `T_i`
+- select query-relevant prototypes from the bank using retrieved neighbors
 - decode memory branch forecasts `y_m^mem`
 - fuse `y_base` and memory branches with a learned reliability-aware gate
 
@@ -30,6 +31,8 @@ data_provider/                    # long-term forecasting datasets
 --wm_branch_num 3
 --wm_retrieve_k 64
 --wm_memory_size 4096
+--wm_global_proto_num 32
+--wm_proto_mode offline
 --wm_memory_update_freq 1
 --wm_horizons 1 4 8 16 32 64 96
 --wm_freeze_base 1
@@ -53,7 +56,7 @@ python -u run.py \
   --enc_in 7 --dec_in 7 --c_out 7 \
   --d_model 64 --n_heads 4 --e_layers 1 --d_layers 1 --d_ff 128 \
   --wm_latent_dim 64 --wm_branch_num 3 --wm_retrieve_k 32 \
-  --wm_memory_size 512 --wm_backbone patch_transformer \
+  --wm_memory_size 512 --wm_global_proto_num 16 --wm_backbone patch_transformer \
   --wm_memory_update_freq 1 \
   --train_epochs 1 --batch_size 16 --itr 1
 ```

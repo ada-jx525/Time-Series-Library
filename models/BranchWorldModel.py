@@ -60,9 +60,10 @@ class Model(nn.Module):
     World-Trajectory Memory Enhancement Module.
 
     This is a memory-enhanced forecaster, not an end-to-end latent world model.
-    It keeps a base forecast, retrieves historical states by z_i^0, discovers
-    multi-horizon latent displacement prototypes, decodes memory branches, and
-    learns a base-vs-memory fusion gate.
+    It keeps a base forecast, learns an offline bank of multi-horizon latent
+    displacement prototypes from training windows, selects state-conditioned
+    dynamics prototypes online, decodes memory branches, and learns a
+    base-vs-memory fusion gate.
     """
 
     def __init__(self, configs):
@@ -76,6 +77,8 @@ class Model(nn.Module):
         self.branch_num = getattr(configs, "wm_branch_num", 3)
         self.retrieve_k = getattr(configs, "wm_retrieve_k", 64)
         self.memory_size = getattr(configs, "wm_memory_size", 4096)
+        self.global_proto_num = getattr(configs, "wm_global_proto_num", 32)
+        self.prototype_mode = getattr(configs, "wm_proto_mode", "offline")
         self.kmeans_iters = getattr(configs, "wm_kmeans_iters", 8)
         self.prototype_refine_iters = getattr(configs, "wm_proto_refine_iters", 2)
         self.proto_state_alpha = getattr(configs, "wm_proto_state_alpha", 1.0)
@@ -155,6 +158,10 @@ class Model(nn.Module):
         # are denormalized with the query window statistics only at output time.
         self.register_buffer("memory_values", torch.empty(0, self.pred_len, self.c_out), persistent=False)
         self.register_buffer("memory_indices", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("memory_proto_ids", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer("prototype_bank", torch.empty(0, self.num_horizons, self.latent_dim), persistent=False)
+        self.register_buffer("prototype_confidence", torch.empty(0), persistent=False)
+        self.register_buffer("prototype_support", torch.empty(0), persistent=False)
         self.register_buffer("memory_ready", torch.tensor(False), persistent=False)
 
     def _normalize(self, x):
@@ -188,10 +195,43 @@ class Model(nn.Module):
         trajectory = torch.stack(future_states, dim=1) - state.unsqueeze(1)
         return state, key, trajectory
 
+    def _reset_memory(self):
+        device = self.memory_ready.device
+        self.memory_keys = torch.empty(0, self.latent_dim, device=device)
+        self.memory_states = torch.empty(0, self.latent_dim, device=device)
+        self.memory_trajectories = torch.empty(0, self.num_horizons, self.latent_dim, device=device)
+        self.memory_values = torch.empty(0, self.pred_len, self.c_out, device=device)
+        self.memory_indices = torch.empty(0, dtype=torch.long, device=device)
+        self.memory_proto_ids = torch.empty(0, dtype=torch.long, device=device)
+        self.prototype_bank = torch.empty(0, self.num_horizons, self.latent_dim, device=device)
+        self.prototype_confidence = torch.empty(0, device=device)
+        self.prototype_support = torch.empty(0, device=device)
+        self.memory_ready.fill_(False)
+
+    @torch.no_grad()
+    def _build_prototype_bank(self, trajectories):
+        flat_dim = self.num_horizons * self.latent_dim
+        proto_num = min(max(1, self.global_proto_num), trajectories.size(0))
+        flat = trajectories.reshape(trajectories.size(0), flat_dim)
+        centers, assign = kmeans_torch(flat, proto_num, self.kmeans_iters)
+        centers = centers.view(proto_num, self.num_horizons, self.latent_dim)
+
+        confidence = trajectories.new_zeros(proto_num)
+        support = trajectories.new_zeros(proto_num)
+        for proto_id in range(proto_num):
+            mask = assign == proto_id
+            support[proto_id] = mask.float().mean()
+            if mask.any():
+                dist = (trajectories[mask] - centers[proto_id].unsqueeze(0)).flatten(start_dim=1)
+                dist = dist.pow(2).sum(dim=-1).sqrt()
+                confidence[proto_id] = torch.exp(-dist.mean() / (flat_dim ** 0.5))
+
+        return centers, assign.long(), confidence.clamp_min(1e-6), support.clamp_min(1e-6)
+
     @torch.no_grad()
     def build_memory(self, data_loader, device):
         if not self.use_memory or self.memory_size <= 0:
-            self.memory_ready.fill_(False)
+            self._reset_memory()
             return
 
         was_training = self.training
@@ -225,7 +265,7 @@ class Model(nn.Module):
             source_indices.append(batch_index.detach().cpu().long())
 
         if not keys:
-            self.memory_ready.fill_(False)
+            self._reset_memory()
             if was_training:
                 self.train()
             return
@@ -244,11 +284,17 @@ class Model(nn.Module):
             values = values[ids]
             source_indices = source_indices[ids]
 
+        prototype_bank, proto_ids, proto_confidence, proto_support = self._build_prototype_bank(trajectories)
+
         self.memory_states = states.detach()
         self.memory_keys = F.normalize(keys.detach(), dim=-1)
         self.memory_trajectories = trajectories.detach()
         self.memory_values = values.detach()
         self.memory_indices = source_indices.detach()
+        self.memory_proto_ids = proto_ids.detach()
+        self.prototype_bank = prototype_bank.detach()
+        self.prototype_confidence = proto_confidence.detach()
+        self.prototype_support = proto_support.detach()
         self.memory_ready.fill_(True)
         if was_training:
             self.train()
@@ -261,14 +307,20 @@ class Model(nn.Module):
 
     def _discover_prototypes(self, query_key, query_index=None):
         B = query_key.size(0)
-        if not (self.use_memory and bool(self.memory_ready) and self.memory_keys.numel() > 0):
+        if not (
+            self.use_memory
+            and bool(self.memory_ready)
+            and self.memory_keys.numel() > 0
+            and self.prototype_bank.numel() > 0
+            and self.memory_proto_ids.numel() == self.memory_keys.size(0)
+        ):
             prototypes, reliability = self._fallback_prototypes(query_key)
             return prototypes, reliability, None
 
         retrieve_k = min(self.retrieve_k, self.memory_keys.size(0))
-        # Retrieval and clustering are memory operations, not differentiable
-        # sequence modeling layers. Stop gradients here to avoid unstable
-        # TopK/k-means gradients leaking into the state encoder.
+        # Retrieval and prototype selection are memory operations, not
+        # differentiable sequence modeling layers. Stop gradients here to avoid
+        # unstable TopK/discrete-selection gradients leaking into the encoder.
         query_key = query_key.detach()
         sim_all = query_key @ self.memory_keys.t()
         if self.training and query_index is not None and self.memory_indices.numel() == self.memory_keys.size(0):
@@ -283,6 +335,7 @@ class Model(nn.Module):
         score, idx = torch.topk(sim_all, k=retrieve_k, dim=-1)
         neighbor_traj = self.memory_trajectories[idx]
         neighbor_values = self.memory_values[idx]
+        neighbor_proto_ids = self.memory_proto_ids[idx]
 
         if not self.use_branch_discovery:
             order = torch.linspace(0, retrieve_k - 1, steps=self.branch_num, device=query_key.device).long()
@@ -293,6 +346,65 @@ class Model(nn.Module):
             size_rel = prototypes.new_full((B, self.branch_num), 1.0 / max(1, retrieve_k))
             return prototypes, torch.stack([state_rel, traj_rel, size_rel], dim=-1), branch_targets
 
+        if self.prototype_mode == "local":
+            prototypes = []
+            reliabilities = []
+            branch_targets = []
+            flat_dim = self.num_horizons * self.latent_dim
+            for batch_id in range(B):
+                local = neighbor_traj[batch_id]
+                local_values = neighbor_values[batch_id]
+                local_flat = local.reshape(retrieve_k, flat_dim)
+                _, assign = kmeans_torch(local_flat, self.branch_num, self.kmeans_iters)
+                proto_m = []
+                rel_m = []
+                target_m = []
+                for branch_id in range(self.branch_num):
+                    mask = assign == branch_id
+                    if not mask.any():
+                        best_id = min(branch_id, retrieve_k - 1)
+                        proto = local[best_id]
+                        target = local_values[best_id]
+                        state_rel = ((score[batch_id, best_id] + 1.0) * 0.5).clamp_min(1e-6)
+                        traj_rel = proto.new_tensor(0.0)
+                        size_rel = proto.new_tensor(0.0)
+                    else:
+                        member = local[mask]
+                        member_values = local_values[mask]
+                        member_score = score[batch_id, mask]
+                        proto = member.mean(dim=0)
+                        state_rel_vec = ((member_score + 1.0) * 0.5).clamp_min(1e-6)
+                        weight = torch.full_like(state_rel_vec, 1.0 / max(1, state_rel_vec.numel()))
+                        for _ in range(max(1, self.prototype_refine_iters)):
+                            dist = (member - proto.unsqueeze(0)).flatten(start_dim=1).pow(2).sum(dim=-1).sqrt()
+                            traj_rel_vec = torch.exp(-dist)
+                            weight = state_rel_vec.pow(self.proto_state_alpha) * traj_rel_vec.pow(self.proto_traj_beta)
+                            weight = weight / weight.sum().clamp_min(1e-6)
+                            proto = (member * weight.view(-1, 1, 1)).sum(dim=0)
+                        target = (member_values * weight.view(-1, 1, 1)).sum(dim=0)
+                        dist = (member - proto.unsqueeze(0)).flatten(start_dim=1).pow(2).sum(dim=-1).sqrt()
+                        traj_rel_vec = torch.exp(-dist)
+                        state_rel = state_rel_vec.mean()
+                        traj_rel = traj_rel_vec.mean()
+                        size_rel = proto.new_tensor(float(mask.sum().item()) / float(retrieve_k))
+                    proto_m.append(proto)
+                    rel_m.append(torch.stack([state_rel, traj_rel, size_rel]))
+                    target_m.append(target)
+                prototypes.append(torch.stack(proto_m, dim=0))
+                reliabilities.append(torch.stack(rel_m, dim=0))
+                branch_targets.append(torch.stack(target_m, dim=0))
+
+            branch_targets = torch.stack(branch_targets, dim=0)
+            return torch.stack(prototypes, dim=0), torch.stack(reliabilities, dim=0), branch_targets
+
+        proto_count = self.prototype_bank.size(0)
+        branch_count = min(self.branch_num, proto_count)
+        state_score = ((score + 1.0) * 0.5).clamp_min(1e-6)
+        proto_scores = query_key.new_zeros(B, proto_count)
+        proto_scores.scatter_add_(1, neighbor_proto_ids, state_score)
+        proto_scores = proto_scores * self.prototype_confidence.unsqueeze(0)
+        selected_score, selected_ids = torch.topk(proto_scores, k=branch_count, dim=-1)
+
         prototypes = []
         reliabilities = []
         branch_targets = []
@@ -300,42 +412,46 @@ class Model(nn.Module):
         for batch_id in range(B):
             local = neighbor_traj[batch_id]
             local_values = neighbor_values[batch_id]
-            local_flat = local.reshape(retrieve_k, flat_dim)
-            _, assign = kmeans_torch(local_flat, self.branch_num, self.kmeans_iters)
             proto_m = []
             rel_m = []
             target_m = []
-            for branch_id in range(self.branch_num):
-                mask = assign == branch_id
+            for branch_id in range(branch_count):
+                proto_id = selected_ids[batch_id, branch_id]
+                proto = self.prototype_bank[proto_id]
+                mask = neighbor_proto_ids[batch_id] == proto_id
                 if not mask.any():
-                    best_id = min(branch_id, retrieve_k - 1)
-                    proto = local[best_id]
-                    target = local_values[best_id]
-                    state_rel = ((score[batch_id, best_id] + 1.0) * 0.5).clamp_min(1e-6)
-                    traj_rel = proto.new_tensor(0.0)
+                    local_flat = local.reshape(retrieve_k, flat_dim)
+                    proto_flat = proto.reshape(1, flat_dim)
+                    dist = (local_flat - proto_flat).pow(2).sum(dim=-1).sqrt()
+                    traj_weight = torch.exp(-dist / (flat_dim ** 0.5))
+                    weight = state_score[batch_id] * traj_weight
+                    weight = weight / weight.sum().clamp_min(1e-6)
+                    target = (local_values * weight.view(-1, 1, 1)).sum(dim=0)
+                    state_rel = (selected_score[batch_id, branch_id] / float(retrieve_k)).clamp_min(1e-6)
+                    traj_rel = self.prototype_confidence[proto_id]
                     size_rel = proto.new_tensor(0.0)
                 else:
                     member = local[mask]
                     member_values = local_values[mask]
-                    member_score = score[batch_id, mask]
-                    proto = member.mean(dim=0)
-                    state_rel = ((member_score + 1.0) * 0.5).clamp_min(1e-6)
-                    weight = torch.full_like(state_rel, 1.0 / max(1, state_rel.numel()))
-                    for _ in range(max(1, self.prototype_refine_iters)):
-                        dist = (member - proto.unsqueeze(0)).flatten(start_dim=1).pow(2).sum(dim=-1).sqrt()
-                        traj_rel_vec = torch.exp(-dist)
-                        weight = state_rel.pow(self.proto_state_alpha) * traj_rel_vec.pow(self.proto_traj_beta)
-                        weight = weight / weight.sum().clamp_min(1e-6)
-                        proto = (member * weight.view(-1, 1, 1)).sum(dim=0)
-                    target = (member_values * weight.view(-1, 1, 1)).sum(dim=0)
+                    member_score = state_score[batch_id, mask]
                     dist = (member - proto.unsqueeze(0)).flatten(start_dim=1).pow(2).sum(dim=-1).sqrt()
-                    traj_rel_vec = torch.exp(-dist)
-                    state_rel = state_rel.mean()
+                    traj_rel_vec = torch.exp(-dist / (flat_dim ** 0.5))
+                    weight = member_score.pow(self.proto_state_alpha) * traj_rel_vec.pow(self.proto_traj_beta)
+                    weight = weight / weight.sum().clamp_min(1e-6)
+                    target = (member_values * weight.view(-1, 1, 1)).sum(dim=0)
+                    state_rel = (selected_score[batch_id, branch_id] / float(retrieve_k)).clamp_min(1e-6)
                     traj_rel = traj_rel_vec.mean()
                     size_rel = proto.new_tensor(float(mask.sum().item()) / float(retrieve_k))
                 proto_m.append(proto)
                 rel_m.append(torch.stack([state_rel, traj_rel, size_rel]))
                 target_m.append(target)
+
+            if branch_count < self.branch_num:
+                pad = self.branch_num - branch_count
+                proto_m.extend([proto_m[-1].clone() for _ in range(pad)])
+                rel_m.extend([rel_m[-1].clone() * 0.0 for _ in range(pad)])
+                target_m.extend([target_m[-1].clone() for _ in range(pad)])
+
             prototypes.append(torch.stack(proto_m, dim=0))
             reliabilities.append(torch.stack(rel_m, dim=0))
             branch_targets.append(torch.stack(target_m, dim=0))
