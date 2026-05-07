@@ -86,6 +86,90 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             extra = extra + freq_weight * freq_loss
         return extra
 
+    def _init_branchworld_diag(self):
+        return {
+            'count': 0,
+            'base_mse_sum': 0.0,
+            'final_mse_sum': 0.0,
+            'decoded_oracle_mse_sum': 0.0,
+            'target_oracle_mse_sum': 0.0,
+            'useful_count': 0,
+            'target_useful_count': 0,
+            'advantage_sum': 0.0,
+            'target_advantage_sum': 0.0,
+            'mem_weight_sum': 0.0,
+            'mem_weight_useful_sum': 0.0,
+            'mem_weight_not_useful_sum': 0.0,
+            'best_branch_weight_sum': 0.0,
+            'best_branch_weight_useful_sum': 0.0,
+            'final_better_count': 0,
+        }
+
+    def _update_branchworld_diag(self, stats, diag, true):
+        base = diag['base']
+        final = diag['pred']
+        memory = diag['memory']
+        weights = diag['weights']
+        base_err = (base - true).pow(2).mean(dim=(1, 2))
+        final_err = (final - true).pow(2).mean(dim=(1, 2))
+        mem_err = (memory - true.unsqueeze(1)).pow(2).mean(dim=(2, 3))
+        best_mem_err, best_mem_id = mem_err.min(dim=1)
+        decoded_oracle_err = torch.minimum(base_err, best_mem_err)
+        useful = best_mem_err < base_err
+        mem_weight = weights[:, 1:].sum(dim=1)
+        best_branch_weight = weights[:, 1:].gather(1, best_mem_id.unsqueeze(1)).squeeze(1)
+
+        batch_count = true.size(0)
+        stats['count'] += batch_count
+        stats['base_mse_sum'] += base_err.sum().item()
+        stats['final_mse_sum'] += final_err.sum().item()
+        stats['decoded_oracle_mse_sum'] += decoded_oracle_err.sum().item()
+        stats['useful_count'] += useful.sum().item()
+        stats['advantage_sum'] += (base_err - best_mem_err).clamp_min(0).sum().item()
+        stats['mem_weight_sum'] += mem_weight.sum().item()
+        stats['best_branch_weight_sum'] += best_branch_weight.sum().item()
+        stats['final_better_count'] += (final_err < base_err).sum().item()
+        if useful.any():
+            stats['mem_weight_useful_sum'] += mem_weight[useful].sum().item()
+            stats['best_branch_weight_useful_sum'] += best_branch_weight[useful].sum().item()
+        if (~useful).any():
+            stats['mem_weight_not_useful_sum'] += mem_weight[~useful].sum().item()
+
+        if 'target' in diag:
+            target_err = (diag['target'] - true.unsqueeze(1)).pow(2).mean(dim=(2, 3))
+            best_target_err = target_err.min(dim=1).values
+            target_useful = best_target_err < base_err
+            stats['target_oracle_mse_sum'] += torch.minimum(base_err, best_target_err).sum().item()
+            stats['target_useful_count'] += target_useful.sum().item()
+            stats['target_advantage_sum'] += (base_err - best_target_err).clamp_min(0).sum().item()
+
+    def _print_branchworld_diag(self, stats):
+        count = max(1, stats['count'])
+        useful_count = max(1, stats['useful_count'])
+        not_useful_count = max(1, stats['count'] - stats['useful_count'])
+        print('BranchWorld diagnostics:')
+        print('  base_mse:{:.6f} final_mse:{:.6f} decoded_oracle_mse:{:.6f} target_oracle_mse:{:.6f}'.format(
+            stats['base_mse_sum'] / count,
+            stats['final_mse_sum'] / count,
+            stats['decoded_oracle_mse_sum'] / count,
+            stats['target_oracle_mse_sum'] / count if stats['target_oracle_mse_sum'] > 0 else float('nan'),
+        ))
+        print('  memory_useful_rate:{:.2f}% target_useful_rate:{:.2f}% final_better_than_base:{:.2f}%'.format(
+            100.0 * stats['useful_count'] / count,
+            100.0 * stats['target_useful_count'] / count,
+            100.0 * stats['final_better_count'] / count,
+        ))
+        print('  avg_positive_advantage:{:.6f} target_avg_positive_advantage:{:.6f}'.format(
+            stats['advantage_sum'] / count,
+            stats['target_advantage_sum'] / count,
+        ))
+        print('  mem_weight_mean:{:.6f} mem_weight_when_useful:{:.6f} mem_weight_when_not_useful:{:.6f} best_branch_weight_when_useful:{:.6f}'.format(
+            stats['mem_weight_sum'] / count,
+            stats['mem_weight_useful_sum'] / useful_count,
+            stats['mem_weight_not_useful_sum'] / not_useful_count,
+            stats['best_branch_weight_useful_sum'] / useful_count,
+        ))
+
     def _build_model(self):
         model = self.model_dict[self.args.model](self.args).float()
 
@@ -98,6 +182,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
+        if self.args.model == 'BranchWorldModel' and getattr(self.args, 'wm_train_gate_only', 0):
+            trainable = []
+            for name, param in self.model.named_parameters():
+                keep = '.gate.' in name or '.base_gate.' in name or name.startswith('gate.') or name.startswith('base_gate.')
+                param.requires_grad = keep
+                if keep:
+                    trainable.append(param)
+            return optim.Adam(trainable, lr=self.args.learning_rate)
         model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         return model_optim
 
@@ -157,6 +249,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
+
+        init_checkpoint = getattr(self.args, 'wm_init_checkpoint', '')
+        if self.args.model == 'BranchWorldModel' and init_checkpoint:
+            print('>>>>>>>loading BranchWorld init checkpoint: {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(init_checkpoint))
+            self.model.load_state_dict(torch.load(init_checkpoint, map_location=self.device))
 
         if self.args.use_amp:
             scaler = torch.cuda.amp.GradScaler()
@@ -265,6 +362,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         preds = []
         trues = []
+        branchworld_diag = None
+        model_core = self._model_core()
+        if self.args.model == 'BranchWorldModel' and hasattr(model_core, 'memory_diagnostics'):
+            branchworld_diag = self._init_branchworld_diag()
         folder_path = './test_results/' + setting + '/'
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
@@ -272,9 +373,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         self.model.eval()
         with torch.no_grad():
             for i, batch in enumerate(test_loader):
-                batch_x, batch_y, batch_x_mark, batch_y_mark, _ = self._unpack_batch(batch)
+                batch_x, batch_y, batch_x_mark, batch_y_mark, batch_index = self._unpack_batch(batch)
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
+                if batch_index is not None:
+                    batch_index = batch_index.to(self.device)
 
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
@@ -283,7 +386,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                 # encoder - decoder
-                if self.args.use_amp:
+                diag = None
+                if branchworld_diag is not None:
+                    diag = model_core.memory_diagnostics(batch_x, query_index=batch_index)
+                    outputs = diag['pred']
+                elif self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
@@ -292,6 +399,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, :]
                 batch_y = batch_y[:, -self.args.pred_len:, :].to(self.device)
+                true_for_diag = batch_y[:, :, f_dim:]
+                if diag is not None:
+                    diag_for_update = {}
+                    for key, value in diag.items():
+                        if key == 'weights':
+                            diag_for_update[key] = value
+                        elif value.dim() == 4:
+                            diag_for_update[key] = value[:, :, :, f_dim:]
+                        else:
+                            diag_for_update[key] = value[:, :, f_dim:]
+                    self._update_branchworld_diag(branchworld_diag, diag_for_update, true_for_diag)
                 outputs = outputs.detach().cpu().numpy()
                 batch_y = batch_y.detach().cpu().numpy()
                 if test_data.scale and self.args.inverse:
@@ -347,6 +465,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         print('mse:{}, mae:{}, dtw:{}'.format(mse, mae, dtw))
+        if branchworld_diag is not None:
+            self._print_branchworld_diag(branchworld_diag)
         f = open("result_long_term_forecast.txt", 'a')
         f.write(setting + "  \n")
         f.write('mse:{}, mae:{}, dtw:{}'.format(mse, mae, dtw))

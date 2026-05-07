@@ -21,6 +21,7 @@ class SinusoidalPosition(nn.Module):
         return self.pe[:, :length]
 
 
+# 给每个时间步打分，让模型学习哪些时间点重要
 class AttentionPool(nn.Module):
     def __init__(self, d_model):
         super().__init__()
@@ -39,7 +40,7 @@ class AttentionPool(nn.Module):
 class PreNormMLP(nn.Module):
     """Small pre-norm residual MLP block."""
 
-    def __init__(self, dim, hidden_dim, dropout=0.0):
+    def __init__(self, dim, hidden_dim, dropout=0.1):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.net = nn.Sequential(
@@ -101,6 +102,24 @@ class StateBackbone(nn.Module):
                 in_ch = d_model
             self.net = nn.Sequential(*layers)
             self.norm = nn.LayerNorm(d_model)
+        elif backbone == "wpmixer":
+            self.net = WPMixerStateBackbone(
+                c_in=c_in,
+                seq_len=seq_len,
+                d_model=d_model,
+                d_ff=d_ff,
+                dropout=dropout,
+                patch_len=self.patch_len,
+                patch_stride=self.patch_stride,
+            )
+        elif backbone == "multiscale_mixer":
+            self.net = MultiScaleMixerStateBackbone(
+                c_in=c_in,
+                seq_len=seq_len,
+                d_model=d_model,
+                d_ff=d_ff,
+                dropout=dropout,
+            )
         elif backbone == "mlp":
             self.net = nn.Sequential(
                 nn.Flatten(start_dim=1),
@@ -112,8 +131,9 @@ class StateBackbone(nn.Module):
             )
         else:
             raise ValueError(
-                "Unknown wm_backbone={}. Choose from temporal_transformer, "
-                "patch_transformer, inverted_transformer, tcn, mlp.".format(backbone)
+                "Unknown wm_backbone={}. Choose from conv, temporal_transformer, "
+                "patch_transformer, inverted_transformer, tcn, mlp, "
+                "wpmixer, multiscale_mixer.".format(backbone)
             )
 
     def forward(self, x):
@@ -143,7 +163,114 @@ class StateBackbone(nn.Module):
             h = h[..., : x.size(1)].permute(0, 2, 1)
             return self.norm(h.mean(dim=1))
 
+        if self.backbone in {"wpmixer", "multiscale_mixer"}:
+            return self.net(x)
+
         return self.net(x)
+
+
+class MixerBlock(nn.Module):
+    def __init__(self, token_dim, channel_dim, hidden_dim, dropout):
+        super().__init__()
+        self.token_norm = nn.LayerNorm(channel_dim)
+        self.token_mlp = nn.Sequential(
+            nn.Linear(token_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, token_dim),
+        )
+        self.channel_norm = nn.LayerNorm(channel_dim)
+        self.channel_mlp = nn.Sequential(
+            nn.Linear(channel_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, channel_dim),
+        )
+
+    def forward(self, x):
+        y = self.token_norm(x).transpose(1, 2)
+        y = self.token_mlp(y).transpose(1, 2)
+        x = x + y
+        x = x + self.channel_mlp(self.channel_norm(x))
+        return x
+
+
+class WPMixerStateBackbone(nn.Module):
+    """
+    Lightweight WPMixer-style state encoder: patch each variable, mix across
+    patch tokens and embedding channels, then aggregate variables/tokens.
+    """
+    def __init__(self, c_in, seq_len, d_model, d_ff, dropout, patch_len=16, patch_stride=8):
+        super().__init__()
+        self.c_in = c_in
+        self.patch_len = max(1, min(patch_len, seq_len))
+        self.patch_stride = max(1, patch_stride)
+        self.patch_num = int((seq_len + self.patch_stride - self.patch_len) / self.patch_stride + 1)
+        self.patch_embed = nn.Linear(self.patch_len, d_model)
+        self.var_embed = nn.Parameter(torch.randn(1, c_in, 1, d_model) * 0.02)
+        self.patch_norm = nn.LayerNorm(d_model)
+        self.mix1 = MixerBlock(self.patch_num, d_model, d_ff, dropout)
+        self.mix2 = MixerBlock(self.patch_num, d_model, d_ff, dropout)
+        self.pool = AttentionPool(d_model)
+        self.out = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        # x: B, L, C -> B, C, L
+        x = x.permute(0, 2, 1).contiguous()
+        needed = (self.patch_num - 1) * self.patch_stride + self.patch_len
+        if x.size(-1) < needed:
+            pad = x[..., -1:].expand(*x.shape[:-1], needed - x.size(-1))
+            x = torch.cat([x, pad], dim=-1)
+        patches = x.unfold(dimension=-1, size=self.patch_len, step=self.patch_stride)
+        patches = patches[:, :, :self.patch_num, :]
+        h = self.patch_norm(self.patch_embed(patches)) + self.var_embed
+        B, C, P, D = h.shape
+        h = h.reshape(B * C, P, D)
+        h = self.mix1(h)
+        h = self.mix2(h)
+        h = h.reshape(B, C * P, D)
+        return self.out(self.pool(h))
+
+
+class MultiScaleMixerStateBackbone(nn.Module):
+    """
+    TimeMixer++-inspired state encoder: extract seasonal/trend summaries from
+    multiple temporal scales and mix the resulting scale tokens.
+    """
+    def __init__(self, c_in, seq_len, d_model, d_ff, dropout):
+        super().__init__()
+        self.scales = [1, 2, 4]
+        self.value_proj = nn.Linear(c_in, d_model)
+        self.trend_proj = nn.Linear(c_in, d_model)
+        self.scale_embed = nn.Parameter(torch.randn(1, len(self.scales) * 2, d_model) * 0.02)
+        self.mixer = nn.Sequential(
+            MixerBlock(len(self.scales) * 2, d_model, d_ff, dropout),
+            MixerBlock(len(self.scales) * 2, d_model, d_ff, dropout),
+        )
+        self.pool = AttentionPool(d_model)
+        self.out = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        tokens = []
+        for scale in self.scales:
+            if scale > 1:
+                xs = F.avg_pool1d(x.permute(0, 2, 1), kernel_size=scale, stride=scale, ceil_mode=True)
+                xs = xs.permute(0, 2, 1)
+            else:
+                xs = x
+            smooth = F.avg_pool1d(
+                xs.permute(0, 2, 1),
+                kernel_size=min(5, xs.size(1)),
+                stride=1,
+                padding=min(5, xs.size(1)) // 2,
+            ).permute(0, 2, 1)
+            smooth = smooth[:, :xs.size(1), :]
+            seasonal = xs - smooth
+            tokens.append(self.value_proj(seasonal.mean(dim=1)))
+            tokens.append(self.trend_proj(smooth.mean(dim=1)))
+        h = torch.stack(tokens, dim=1) + self.scale_embed
+        h = self.mixer(h)
+        return self.out(self.pool(h))
 
 
 class LatentStateEncoder(nn.Module):
@@ -153,19 +280,49 @@ class LatentStateEncoder(nn.Module):
     state = s_i: 用于 decoder / rollout / trajectory construction
     key   = k_i: 用于 memory retrieval
     """
-    def __init__(self, c_in, seq_len, latent_dim, dropout):
+    def __init__(
+        self,
+        c_in,
+        seq_len,
+        latent_dim,
+        dropout,
+        backbone="conv",
+        n_heads=4,
+        d_ff=None,
+        e_layers=1,
+        patch_len=16,
+        patch_stride=8,
+    ):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv1d(c_in, latent_dim, kernel_size=8, stride=4, padding=2),
-            nn.GELU(),
-            nn.Conv1d(latent_dim, latent_dim, kernel_size=4, stride=2, padding=1),
-            nn.GELU(),
-            nn.Conv1d(latent_dim, latent_dim, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-            nn.AdaptiveAvgPool1d(1),
-        )
+        self.backbone = backbone
+        d_ff = d_ff or latent_dim * 2
+        if backbone == "conv":
+            self.encoder = nn.Sequential(
+                nn.Conv1d(c_in, latent_dim, kernel_size=8, stride=4, padding=2),
+                nn.GELU(),
+                nn.Conv1d(latent_dim, latent_dim, kernel_size=4, stride=2, padding=1),
+                nn.GELU(),
+                nn.Conv1d(latent_dim, latent_dim, kernel_size=3, stride=1, padding=1),
+                nn.GELU(),
+                nn.AdaptiveAvgPool1d(1),
+            )
+            self.flatten = nn.Flatten()
+        else:
+            self.encoder = StateBackbone(
+                c_in=c_in,
+                seq_len=seq_len,
+                d_model=latent_dim,
+                n_heads=n_heads,
+                d_ff=d_ff,
+                e_layers=e_layers,
+                dropout=dropout,
+                backbone=backbone,
+                patch_len=patch_len,
+                patch_stride=patch_stride,
+            )
+            self.flatten = nn.Identity()
         self.head = nn.Sequential(
-            nn.Flatten(),
+            self.flatten,
             nn.LayerNorm(latent_dim),
             nn.Linear(latent_dim, latent_dim),
             nn.GELU(),
@@ -179,7 +336,8 @@ class LatentStateEncoder(nn.Module):
 
     def forward(self, x):
         # x: (B, seq_len, c_in)
-        x = x.permute(0, 2, 1).contiguous()
+        if self.backbone == "conv":
+            x = x.permute(0, 2, 1).contiguous()
         state = self.head(self.encoder(x))
         key = F.normalize(self.key_head(state), dim=-1)
         return state, key
@@ -212,6 +370,68 @@ class MemoryBranchDecoder(nn.Module):
         return y.view(B, M, self.pred_len, self.c_out)
 
 
+class SequenceMemoryBranchDecoder(nn.Module):
+    def __init__(
+        self,
+        latent_dim,
+        num_horizons,
+        pred_len,
+        c_out,
+        hidden_dim,
+        dropout,
+        decoder_type="gru",
+        n_heads=4,
+    ):
+        super().__init__()
+        self.pred_len = pred_len
+        self.c_out = c_out
+        self.decoder_type = decoder_type
+        self.input = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, hidden_dim),
+        )
+        self.position = SinusoidalPosition(hidden_dim, max_len=num_horizons + 1)
+        if decoder_type == "transformer":
+            self.sequence = make_transformer_encoder(
+                hidden_dim,
+                n_heads=max(1, min(n_heads, hidden_dim)),
+                d_ff=hidden_dim * 2,
+                e_layers=1,
+                dropout=dropout,
+            )
+        else:
+            self.sequence = nn.GRU(
+                hidden_dim,
+                hidden_dim,
+                num_layers=1,
+                batch_first=True,
+                dropout=0.0,
+            )
+        self.pool = AttentionPool(hidden_dim)
+        self.blocks = nn.Sequential(
+            PreNormMLP(hidden_dim, hidden_dim * 2, dropout),
+            PreNormMLP(hidden_dim, hidden_dim * 2, dropout),
+        )
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out = nn.Linear(hidden_dim, pred_len * c_out)
+
+    def forward(self, state, prototypes):
+        B, M, S, Z = prototypes.shape
+        state_ctx = state.unsqueeze(1).expand(B, M, Z)
+        future_states = state_ctx.unsqueeze(2) + prototypes
+        seq = torch.cat([state_ctx.unsqueeze(2), future_states], dim=2)
+        seq = seq.reshape(B * M, S + 1, Z)
+        h = self.input(seq) + self.position(S + 1).to(seq.device)
+        if self.decoder_type == "transformer":
+            h = self.sequence(h)
+        else:
+            h, _ = self.sequence(h)
+        h = self.pool(h).view(B, M, -1)
+        h = self.blocks(h)
+        y = self.out(self.out_norm(h))
+        return y.view(B, M, self.pred_len, self.c_out)
+
+
 def make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout):
     layer = nn.TransformerEncoderLayer(
         d_model=d_model,
@@ -225,29 +445,72 @@ def make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout):
     return nn.TransformerEncoder(layer, num_layers=max(1, e_layers))
 
 
-def kmeans_torch(x, num_clusters, num_iters=8):
+def kmeans_torch(x, num_clusters, num_iters=8, normalize=True, eps=1e-6):
+    """
+    x: (K, D), usually flattened trajectories
+    return:
+        centers: (num_clusters, D) in original space
+        assign:  (K,)
+    """
     if x.size(0) == 0:
         raise ValueError("kmeans_torch received an empty tensor.")
-    if x.size(0) <= num_clusters:
-        pad = num_clusters - x.size(0)
+
+    K, D = x.shape
+
+    if K <= num_clusters:
+        pad = num_clusters - K
         centers = x
         if pad > 0:
             centers = torch.cat([centers, x[-1:].expand(pad, -1)], dim=0)
-        assign = torch.arange(x.size(0), device=x.device).clamp(max=num_clusters - 1)
+        assign = torch.arange(K, device=x.device).clamp(max=num_clusters - 1)
         return centers, assign
 
-    init_ids = torch.linspace(0, x.size(0) - 1, steps=num_clusters, device=x.device).long()
-    centers = x[init_ids].clone()
-    assign = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+    # normalize only for clustering distance
+    if normalize:
+        mean = x.mean(dim=0, keepdim=True)
+        std = x.std(dim=0, keepdim=True).clamp_min(eps)
+        x_cluster = (x - mean) / std
+    else:
+        mean, std = None, None
+        x_cluster = x
+
+    # k-means++ initialization
+    centers_cluster = []
+    first_id = torch.randint(0, K, (1,), device=x.device).item()
+    centers_cluster.append(x_cluster[first_id])
+
+    for _ in range(1, num_clusters):
+        current_centers = torch.stack(centers_cluster, dim=0)
+        dist = torch.cdist(x_cluster, current_centers, p=2).min(dim=1).values
+        prob = dist / (dist.sum() + eps)
+        next_id = torch.multinomial(prob, 1).item()
+        centers_cluster.append(x_cluster[next_id])
+
+    centers_cluster = torch.stack(centers_cluster, dim=0)
+    assign = torch.zeros(K, dtype=torch.long, device=x.device)
+
     for _ in range(max(1, num_iters)):
-        dist = torch.cdist(x, centers, p=2)
+        dist = torch.cdist(x_cluster, centers_cluster, p=2)
         assign = dist.argmin(dim=1)
+
         new_centers = []
-        for cluster_id in range(num_clusters):
-            mask = assign == cluster_id
+        min_dist = dist.min(dim=1).values
+
+        for cid in range(num_clusters):
+            mask = assign == cid
             if mask.any():
-                new_centers.append(x[mask].mean(dim=0))
+                new_centers.append(x_cluster[mask].mean(dim=0))
             else:
-                new_centers.append(centers[cluster_id])
-        centers = torch.stack(new_centers, dim=0)
+                # reinitialize empty cluster with farthest sample
+                farthest_id = min_dist.argmax()
+                new_centers.append(x_cluster[farthest_id])
+
+        centers_cluster = torch.stack(new_centers, dim=0)
+
+    # convert centers back to original space
+    if normalize:
+        centers = centers_cluster * std + mean
+    else:
+        centers = centers_cluster
+
     return centers, assign

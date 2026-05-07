@@ -179,8 +179,12 @@ if __name__ == '__main__':
                         help='use trajectory memory; 0 uses only zero-memory prototypes plus base expert')
     parser.add_argument('--wm_use_branch_discovery', type=int, choices=[0, 1], default=1,
                         help='1 clusters retrieved trajectories into prototypes; 0 uses selected raw trajectories')
-    parser.add_argument('--wm_backbone', type=str, default='patch_transformer',
-                        choices=['temporal_transformer', 'patch_transformer', 'inverted_transformer', 'tcn', 'mlp'],
+    parser.add_argument('--wm_backbone', type=str, default='conv',
+                        choices=[
+                            'conv', 'temporal_transformer', 'patch_transformer',
+                            'inverted_transformer', 'tcn', 'mlp',
+                            'wpmixer', 'multiscale_mixer',
+                        ],
                         help='latent state encoder backbone')
     parser.add_argument('--wm_patch_len', type=int, default=16,
                         help='patch length for patch_transformer state encoder')
@@ -190,18 +194,60 @@ if __name__ == '__main__':
                         help='refresh memory every N epochs; 0 builds once after warmup')
     parser.add_argument('--wm_memory_warmup_epochs', type=int, default=0,
                         help='initial epochs trained before memory refresh starts')
-    parser.add_argument('--wm_base_type', type=str, choices=['linear', 'dlinear'], default='dlinear',
+    parser.add_argument('--wm_base_type', type=str, choices=['linear', 'dlinear', 'chronos_bolt'], default='dlinear',
                         help='lightweight base forecaster used as y_base')
+    parser.add_argument('--wm_chronos_model', type=str, default='amazon/chronos-bolt-tiny',
+                        help='Chronos-Bolt Hugging Face model id when wm_base_type=chronos_bolt')
+    parser.add_argument('--wm_chronos_quantile_index', type=int, default=None,
+                        help='quantile index selected from Chronos-Bolt output; default uses median index')
+    parser.add_argument('--wm_chronos_local_files_only', type=int, choices=[0, 1], default=0,
+                        help='load Chronos-Bolt only from local Hugging Face cache')
+    parser.add_argument('--wm_chronos_cache_path', type=str, default='',
+                        help='optional disk cache for Chronos-Bolt normalized-window forecasts')
+    parser.add_argument('--wm_chronos_cache_save_interval', type=int, default=0,
+                        help='number of new Chronos forecasts between cache saves; 0 saves only on process exit')
     parser.add_argument('--wm_freeze_base', type=int, choices=[0, 1], default=1,
                         help='freeze y_base forecaster while training memory module')
     parser.add_argument('--wm_mem_loss_type', type=str, choices=['min', 'all', 'weighted'], default='min',
                         help='memory branch auxiliary loss: min-over-branches, all branches, or gate-weighted')
     parser.add_argument('--wm_mem_weight', type=float, default=0.1,
                         help='weighted memory branch auxiliary loss')
+    parser.add_argument('--wm_decoder_type', type=str, choices=['mlp', 'gru', 'transformer'], default='mlp',
+                        help='memory branch decoder architecture')
     parser.add_argument('--wm_traj_weight', type=float, default=0.0,
                         help='optional trajectory consistency loss weight')
     parser.add_argument('--wm_base_weight', type=float, default=0.0,
                         help='optional auxiliary loss on y_base')
+    parser.add_argument('--wm_residual_weight', type=float, default=0.0,
+                        help='SmoothL1 penalty keeping memory branch forecasts close to the base anchor')
+    parser.add_argument('--wm_gate_reg_weight', type=float, default=0.0,
+                        help='penalty for excessive total memory fusion weight')
+    parser.add_argument('--wm_gate_reg_threshold', type=float, default=0.05,
+                        help='memory fusion weight threshold before gate regularization activates')
+    parser.add_argument('--wm_gate_weight', type=float, default=0.0,
+                        help='oracle expert classification loss weight for base-vs-memory fusion gate')
+    parser.add_argument('--wm_gate_margin', type=float, default=0.0,
+                        help='minimum MSE improvement required before oracle gate target switches from base to memory')
+    parser.add_argument('--wm_gate_loss_type', type=str, choices=['ce', 'pairwise'], default='pairwise',
+                        help='gate calibration loss: ce oracle classification or conservative pairwise ranking')
+    parser.add_argument('--wm_gate_soft_weight', type=float, default=0.0,
+                        help='weak KL distillation from oracle expert errors to fusion gate weights')
+    parser.add_argument('--wm_gate_soft_tau', type=float, default=0.1,
+                        help='temperature for soft oracle gate distillation')
+    parser.add_argument('--wm_adv_gate_weight', type=float, default=0.0,
+                        help='advantage-aware gate calibration loss weight')
+    parser.add_argument('--wm_adv_gate_margin', type=float, default=0.0,
+                        help='minimum decoded memory advantage before preserving memory gate weight')
+    parser.add_argument('--wm_adv_gate_target', type=float, default=0.2,
+                        help='minimum memory weight target when decoded memory has enough advantage')
+    parser.add_argument('--wm_branch_div_weight', type=float, default=0.0,
+                        help='differentiable memory branch forecast diversity loss weight')
+    parser.add_argument('--wm_branch_div_tau', type=float, default=1.0,
+                        help='temperature for differentiable memory branch diversity loss')
+    parser.add_argument('--wm_train_gate_only', type=int, choices=[0, 1], default=0,
+                        help='freeze all non-gate BranchWorld parameters during training')
+    parser.add_argument('--wm_init_checkpoint', type=str, default='',
+                        help='optional BranchWorld checkpoint path used to initialize training')
     parser.add_argument('--wm_mae_weight', type=float, default=0.0,
                         help='optional MAE term added to final prediction loss')
     parser.add_argument('--wm_freq_loss_weight', type=float, default=0.0,
