@@ -1,0 +1,20 @@
+# ETTh1 formal GPU benchmark commands.
+# Run from the repository root. Each command is independent and prints live logs.
+# Formal setting: train_epochs=150, early stopping enabled with patience=10.
+# To use another GPU, change CUDA_VISIBLE_DEVICES and --gpu in configs/benchmark/etth1_common.args.
+
+# Main method: BranchWorld offline global latent dynamics prototype bank.
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 96 --model_id ETTh1_96_96_BranchWorld_offline_bank --wm_proto_mode offline --des branchworld_offline_bank
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 192 --model_id ETTh1_96_192_BranchWorld_offline_bank --wm_proto_mode offline --des branchworld_offline_bank
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 336 --model_id ETTh1_96_336_BranchWorld_offline_bank --wm_proto_mode offline --des branchworld_offline_bank
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 720 --model_id ETTh1_96_720_BranchWorld_offline_bank --wm_proto_mode offline --des branchworld_offline_bank
+
+# Ablations, run at pred_len=96 first.
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 96 --model_id ETTh1_96_96_BranchWorld_local_dynamic --wm_proto_mode local --des branchworld_local_dynamic
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 96 --model_id ETTh1_96_96_BranchWorld_raw_neighbor --wm_proto_mode offline --wm_use_branch_discovery 0 --des branchworld_raw_neighbor
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 96 --model_id ETTh1_96_96_BranchWorld_no_memory --wm_proto_mode offline --wm_use_memory 0 --des branchworld_no_memory
+
+# Classic baselines, same formal training setting.
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model DLinear --pred_len 96 --model_id ETTh1_96_96_DLinear --des dlinear_baseline
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model PatchTST --pred_len 96 --model_id ETTh1_96_96_PatchTST --des patchtst_baseline
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model iTransformer --pred_len 96 --model_id ETTh1_96_96_iTransformer --des itransformer_baseline

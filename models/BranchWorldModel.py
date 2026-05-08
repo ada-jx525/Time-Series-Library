@@ -1,3 +1,4 @@
+import importlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -89,6 +90,7 @@ class Model(nn.Module):
         self.traj_weight = getattr(configs, "wm_traj_weight", 0.0)
         self.base_weight = getattr(configs, "wm_base_weight", 0.0)
         self.base_type = getattr(configs, "wm_base_type", "dlinear")
+        self.base_model = getattr(configs, "wm_base_model", self.base_type)
         self.mem_loss_type = getattr(configs, "wm_mem_loss_type", "min")
         self.freeze_base = bool(getattr(configs, "wm_freeze_base", 1))
 
@@ -100,9 +102,12 @@ class Model(nn.Module):
             self.horizons = [self.pred_len]
         self.num_horizons = len(self.horizons)
 
-        if self.base_type == "linear":
+        if self.base_model in ["linear", "dlinear"]:
+            self.base_type = self.base_model
+        if self.base_model == "linear":
             self.base_forecaster = LinearBase(self.seq_len, self.pred_len, self.c_out)
-        else:
+            self.base_is_external = False
+        elif self.base_model == "dlinear":
             self.base_forecaster = DLinearBase(
                 self.seq_len,
                 self.pred_len,
@@ -110,6 +115,13 @@ class Model(nn.Module):
                 getattr(configs, "moving_avg", 25),
                 bool(getattr(configs, "individual", False)),
             )
+            self.base_is_external = False
+        else:
+            if self.base_model == "BranchWorldModel":
+                raise ValueError("wm_base_model cannot be BranchWorldModel.")
+            module = importlib.import_module("models.{}".format(self.base_model))
+            self.base_forecaster = module.Model(configs)
+            self.base_is_external = True
         if self.freeze_base:
             for param in self.base_forecaster.parameters():
                 param.requires_grad = False
@@ -176,8 +188,22 @@ class Model(nn.Module):
             stdev = stdev[..., -y.size(-1):]
         return y * stdev[:, 0, :].unsqueeze(1) + means[:, 0, :].unsqueeze(1)
 
-    def _base_forecast(self, norm_x):
-        return self.base_forecaster(norm_x[:, :, -self.c_out:])
+    def _normalize_decoder_input(self, x_dec, means, stdev):
+        if x_dec is None:
+            return None
+        if means.size(-1) != x_dec.size(-1):
+            means = means[..., -x_dec.size(-1):]
+            stdev = stdev[..., -x_dec.size(-1):]
+        return (x_dec - means[:, :, -x_dec.size(-1):]) / stdev[:, :, -x_dec.size(-1):]
+
+    def _base_forecast(self, norm_x, x_mark_enc=None, x_dec=None, x_mark_dec=None, means=None, stdev=None):
+        if not self.base_is_external:
+            return self.base_forecaster(norm_x[:, :, -self.c_out:])
+        norm_dec = self._normalize_decoder_input(x_dec, means, stdev)
+        y_base = self.base_forecaster(norm_x, x_mark_enc, norm_dec, x_mark_dec)
+        if y_base.size(-1) != self.c_out:
+            y_base = y_base[:, :, -self.c_out:]
+        return y_base[:, -self.pred_len:, :]
 
     def _shifted_windows(self, norm_x, norm_future):
         series = torch.cat([norm_x, norm_future], dim=1)
@@ -479,9 +505,16 @@ class Model(nn.Module):
         y_hat = y_hat + (weights[:, 1:].unsqueeze(-1).unsqueeze(-1) * y_mem).sum(dim=1)
         return y_hat, weights
 
-    def _forecast_normalized(self, x_enc, future_y=None, query_index=None):
+    def _forecast_normalized(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, future_y=None, query_index=None):
         norm_x, means, stdev = self._normalize(x_enc)
-        y_base = self._base_forecast(norm_x)
+        y_base = self._base_forecast(
+            norm_x,
+            x_mark_enc=x_mark_enc,
+            x_dec=x_dec,
+            x_mark_dec=x_mark_dec,
+            means=means,
+            stdev=stdev,
+        )
         state, key = self.state_encoder(norm_x)
         prototypes, reliability, branch_targets = self._discover_prototypes(key, query_index=query_index)
         y_mem = self.memory_decoder(state, prototypes)
@@ -514,7 +547,14 @@ class Model(nn.Module):
         return self._last_aux_loss
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, future_y=None, query_index=None):
-        pred, means, stdev = self._forecast_normalized(x_enc, future_y=future_y, query_index=query_index)
+        pred, means, stdev = self._forecast_normalized(
+            x_enc,
+            x_mark_enc=x_mark_enc,
+            x_dec=x_dec,
+            x_mark_dec=x_mark_dec,
+            future_y=future_y,
+            query_index=query_index,
+        )
         return self._denormalize(pred, means, stdev)
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None, future_y=None, query_index=None):

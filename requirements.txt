@@ -1,14 +1,27 @@
-# Time-Series-Library long-term forecasting dependencies.
-# Install PyTorch separately for your CUDA version, then install this file.
+# Time-Series-Library / BranchWorld server dependencies.
+# For CUDA servers, install PyTorch first with the command matching your CUDA
+# version from https://pytorch.org/get-started/locally/, then run:
+#   pip install -r requirements.txt
+#
+# Example for recent CUDA 12.8 servers:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-numpy==1.26.4
-pandas==2.2.3
-scikit-learn==1.5.2
-scipy==1.13.1
-matplotlib==3.9.2
-tqdm==4.66.5
+numpy>=1.26,<2.0
+pandas>=2.2,<3.0
+scikit-learn>=1.5,<2.0
+scipy>=1.13,<2.0
+matplotlib>=3.9,<4.0
+tqdm>=4.66,<5.0
 
-einops==0.8.1
-local-attention==1.11.2
-reformer-pytorch==1.4.4
-PyWavelets==1.8.0
+einops>=0.8,<1.0
+local-attention>=1.11,<2.0
+reformer-pytorch>=1.4,<2.0
+PyWavelets>=1.8,<2.0
+sympy>=1.12,<2.0
+
+# Optional but useful when data files are not already under ./dataset.
+datasets>=2.20,<4.0
+huggingface_hub>=0.24,<1.0
+
+# Only needed if you enable edit-distance DTW variants.
+nltk>=3.8,<4.0

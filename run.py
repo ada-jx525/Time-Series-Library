@@ -5,6 +5,12 @@ import torch.backends
 from utils.print_args import print_args
 import random
 import numpy as np
+import shlex
+
+
+class ArgumentParserWithFiles(argparse.ArgumentParser):
+    def convert_arg_line_to_args(self, arg_line):
+        return shlex.split(arg_line, comments=True)
 
 if __name__ == '__main__':
     fix_seed = 2021
@@ -12,7 +18,10 @@ if __name__ == '__main__':
     torch.manual_seed(fix_seed)
     np.random.seed(fix_seed)
 
-    parser = argparse.ArgumentParser(description='Time-Series-Library long-term forecasting')
+    parser = ArgumentParserWithFiles(
+        description='Time-Series-Library long-term forecasting',
+        fromfile_prefix_chars='@',
+    )
 
     # basic config
     parser.add_argument('--task_name', type=str, required=True, default='long_term_forecast',
@@ -196,6 +205,8 @@ if __name__ == '__main__':
                         help='initial epochs trained before memory refresh starts')
     parser.add_argument('--wm_base_type', type=str, choices=['linear', 'dlinear'], default='dlinear',
                         help='lightweight base forecaster used as y_base')
+    parser.add_argument('--wm_base_model', type=str, default='dlinear',
+                        help='base forecaster inside BranchWorldModel; use dlinear, linear, PatchTST, iTransformer, etc.')
     parser.add_argument('--wm_freeze_base', type=int, choices=[0, 1], default=1,
                         help='freeze y_base forecaster while training memory module')
     parser.add_argument('--wm_mem_loss_type', type=str, choices=['min', 'all', 'weighted'], default='min',
