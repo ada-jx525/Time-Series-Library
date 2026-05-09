@@ -207,16 +207,24 @@ if __name__ == '__main__':
                         help='lightweight base forecaster used as y_base')
     parser.add_argument('--wm_base_model', type=str, default='dlinear',
                         help='base forecaster inside BranchWorldModel; use dlinear, linear, PatchTST, iTransformer, etc.')
+    parser.add_argument('--wm_base_checkpoint', type=str, default='',
+                        help='optional checkpoint path loaded into the BranchWorld base forecaster before freezing/training')
     parser.add_argument('--wm_freeze_base', type=int, choices=[0, 1], default=1,
                         help='freeze y_base forecaster while training memory module')
     parser.add_argument('--wm_mem_loss_type', type=str, choices=['min', 'all', 'weighted'], default='min',
-                        help='memory branch auxiliary loss: min-over-branches, all branches, or gate-weighted')
+                        help='adapter residual auxiliary loss: min-over-branches, all branches, or gate-weighted')
     parser.add_argument('--wm_mem_weight', type=float, default=0.1,
-                        help='weighted memory branch auxiliary loss')
+                        help='adapter residual auxiliary loss weight')
+    parser.add_argument('--wm_alpha_weight', type=float, default=0.01,
+                        help='memory usage penalty weight on mean confidence alpha')
+    parser.add_argument('--wm_conflict_weight', type=float, default=0.0,
+                        help='optional penalty on alpha-scaled correction magnitude')
+    parser.add_argument('--wm_delta_clamp', type=float, default=3.0,
+                        help='clamp value for residual adapter target; <=0 disables clamping')
     parser.add_argument('--wm_traj_weight', type=float, default=0.0,
-                        help='optional trajectory consistency loss weight')
+                        help='deprecated; retained for compatibility')
     parser.add_argument('--wm_base_weight', type=float, default=0.0,
-                        help='optional auxiliary loss on y_base')
+                        help='deprecated; retained for compatibility')
     parser.add_argument('--wm_mae_weight', type=float, default=0.0,
                         help='optional MAE term added to final prediction loss')
     parser.add_argument('--wm_freq_loss_weight', type=float, default=0.0,

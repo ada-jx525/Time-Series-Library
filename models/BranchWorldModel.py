@@ -63,8 +63,8 @@ class Model(nn.Module):
     This is a memory-enhanced forecaster, not an end-to-end latent world model.
     It keeps a base forecast, learns an offline bank of multi-horizon latent
     displacement prototypes from training windows, selects state-conditioned
-    dynamics prototypes online, decodes memory branches, and learns a
-    base-vs-memory fusion gate.
+    dynamics prototypes online, and uses them as a residual correction adapter
+    around an existing forecaster.
     """
 
     def __init__(self, configs):
@@ -87,10 +87,12 @@ class Model(nn.Module):
         self.use_memory = bool(getattr(configs, "wm_use_memory", 1))
         self.use_branch_discovery = bool(getattr(configs, "wm_use_branch_discovery", 1))
         self.mem_weight = getattr(configs, "wm_mem_weight", 0.1)
-        self.traj_weight = getattr(configs, "wm_traj_weight", 0.0)
-        self.base_weight = getattr(configs, "wm_base_weight", 0.0)
+        self.alpha_weight = getattr(configs, "wm_alpha_weight", 0.01)
+        self.conflict_weight = getattr(configs, "wm_conflict_weight", 0.0)
+        self.delta_clamp = getattr(configs, "wm_delta_clamp", 3.0)
         self.base_type = getattr(configs, "wm_base_type", "dlinear")
         self.base_model = getattr(configs, "wm_base_model", self.base_type)
+        self.base_checkpoint = getattr(configs, "wm_base_checkpoint", "")
         self.mem_loss_type = getattr(configs, "wm_mem_loss_type", "min")
         self.freeze_base = bool(getattr(configs, "wm_freeze_base", 1))
 
@@ -122,6 +124,8 @@ class Model(nn.Module):
             module = importlib.import_module("models.{}".format(self.base_model))
             self.base_forecaster = module.Model(configs)
             self.base_is_external = True
+        if self.base_checkpoint:
+            self._load_base_checkpoint(self.base_checkpoint)
         if self.freeze_base:
             for param in self.base_forecaster.parameters():
                 param.requires_grad = False
@@ -132,7 +136,7 @@ class Model(nn.Module):
             dropout=configs.dropout,
             latent_dim=self.latent_dim,
         )
-        self.memory_decoder = MemoryBranchDecoder(
+        self.memory_adapter = MemoryBranchDecoder(
             latent_dim=self.latent_dim,
             num_horizons=self.num_horizons,
             pred_len=self.pred_len,
@@ -147,20 +151,17 @@ class Model(nn.Module):
             nn.Dropout(configs.dropout),
             nn.Linear(configs.d_ff, 1),
         )
-        self.base_gate = nn.Sequential(
-            nn.LayerNorm(self.latent_dim + 4),
-            nn.Linear(self.latent_dim + 4, configs.d_ff),
+
+        self.conf_head = nn.Sequential(
+            nn.LayerNorm(self.latent_dim + self.num_horizons * self.latent_dim + 4),
+            nn.Linear(self.latent_dim + self.num_horizons * self.latent_dim + 4, configs.d_ff),
             nn.GELU(),
             nn.Dropout(configs.dropout),
             nn.Linear(configs.d_ff, 1),
         )
-        self.traj_head = nn.Sequential(
-            nn.LayerNorm(self.pred_len * self.c_out),
-            nn.Linear(self.pred_len * self.c_out, configs.d_ff),
-            nn.GELU(),
-            nn.Linear(configs.d_ff, self.num_horizons * self.latent_dim),
-        )
+        nn.init.constant_(self.conf_head[-1].bias, -3.0)
         self._last_aux_loss = None
+        self._last_memory_stats = None
 
         self.register_buffer("memory_keys", torch.empty(0, self.latent_dim), persistent=False)
         self.register_buffer("memory_states", torch.empty(0, self.latent_dim), persistent=False)
@@ -176,6 +177,42 @@ class Model(nn.Module):
         self.register_buffer("prototype_support", torch.empty(0), persistent=False)
         self.register_buffer("memory_ready", torch.tensor(False), persistent=False)
 
+    def _load_base_checkpoint(self, checkpoint_path):
+        state = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        if not isinstance(state, dict):
+            raise ValueError("Base checkpoint must contain a state_dict.")
+
+        base_state = self.base_forecaster.state_dict()
+        candidates = [
+            state,
+            {k[len("module.") :]: v for k, v in state.items() if k.startswith("module.")},
+            {k[len("base_forecaster.") :]: v for k, v in state.items() if k.startswith("base_forecaster.")},
+            {k[len("module.base_forecaster.") :]: v for k, v in state.items() if k.startswith("module.base_forecaster.")},
+        ]
+
+        best = {}
+        for candidate in candidates:
+            matched = {
+                k: v for k, v in candidate.items()
+                if k in base_state and tuple(v.shape) == tuple(base_state[k].shape)
+            }
+            if len(matched) > len(best):
+                best = matched
+
+        if not best:
+            raise RuntimeError(
+                "No compatible parameters found in base checkpoint: {}".format(checkpoint_path)
+            )
+
+        missing, unexpected = self.base_forecaster.load_state_dict(best, strict=False)
+        print(
+            "Loaded base checkpoint: {} (matched {}, missing {}, unexpected {})".format(
+                checkpoint_path, len(best), len(missing), len(unexpected)
+            )
+        )
+
     def _normalize(self, x):
         means = x.mean(1, keepdim=True).detach()
         x = x - means
@@ -188,22 +225,38 @@ class Model(nn.Module):
             stdev = stdev[..., -y.size(-1):]
         return y * stdev[:, 0, :].unsqueeze(1) + means[:, 0, :].unsqueeze(1)
 
-    def _normalize_decoder_input(self, x_dec, means, stdev):
-        if x_dec is None:
-            return None
-        if means.size(-1) != x_dec.size(-1):
-            means = means[..., -x_dec.size(-1):]
-            stdev = stdev[..., -x_dec.size(-1):]
-        return (x_dec - means[:, :, -x_dec.size(-1):]) / stdev[:, :, -x_dec.size(-1):]
+    def _call_external_base(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None):
+        y_base = self.base_forecaster(x_enc, x_mark_enc, x_dec, x_mark_dec)
 
-    def _base_forecast(self, norm_x, x_mark_enc=None, x_dec=None, x_mark_dec=None, means=None, stdev=None):
-        if not self.base_is_external:
-            return self.base_forecaster(norm_x[:, :, -self.c_out:])
-        norm_dec = self._normalize_decoder_input(x_dec, means, stdev)
-        y_base = self.base_forecaster(norm_x, x_mark_enc, norm_dec, x_mark_dec)
+        if isinstance(y_base, tuple):
+            y_base = y_base[0]
+
         if y_base.size(-1) != self.c_out:
             y_base = y_base[:, :, -self.c_out:]
+
         return y_base[:, -self.pred_len:, :]
+
+    def _base_forecast(self, norm_x, x_enc=None, x_mark_enc=None, x_dec=None, x_mark_dec=None, means=None, stdev=None):
+        if not self.base_is_external:
+            return self.base_forecaster(norm_x[:, :, -self.c_out:])
+
+        # External base models use raw inputs, matching their standalone baseline path.
+        y_base_raw = self._call_external_base(
+            x_enc=x_enc,
+            x_mark_enc=x_mark_enc,
+            x_dec=x_dec,
+            x_mark_dec=x_mark_dec,
+        )
+
+        if means.size(-1) != y_base_raw.size(-1):
+            means_y = means[..., -y_base_raw.size(-1):]
+            stdev_y = stdev[..., -y_base_raw.size(-1):]
+        else:
+            means_y = means
+            stdev_y = stdev
+
+        y_base_norm = (y_base_raw - means_y[:, 0, :].unsqueeze(1)) / stdev_y[:, 0, :].unsqueeze(1)
+        return y_base_norm
 
     def _shifted_windows(self, norm_x, norm_future):
         series = torch.cat([norm_x, norm_future], dim=1)
@@ -485,66 +538,113 @@ class Model(nn.Module):
         branch_targets = torch.stack(branch_targets, dim=0)
         return torch.stack(prototypes, dim=0), torch.stack(reliabilities, dim=0), branch_targets
 
-    def _fusion(self, state, prototypes, reliability, y_base, y_mem):
-        B, M = y_mem.shape[:2]
-        disagreement = (y_mem - y_base.unsqueeze(1)).abs().mean(dim=(2, 3), keepdim=False).unsqueeze(-1)
-        branch_features = torch.cat([reliability, disagreement], dim=-1)
+    def _fusion(self, state, prototypes, reliability, y_base, delta_mem):
+        """
+        Prototype-guided residual adapter with sample-wise memory confidence.
+
+        y_hat = y_base + alpha_q * sum_m w_m * Delta_m
+
+        where:
+            w_m     decides which memory branch direction to use
+            alpha_q decides how much memory should be used for each sample
+        """
+        B, M = delta_mem.shape[:2]
+
+        correction_scale = delta_mem.abs().mean(dim=(2, 3)).unsqueeze(-1)
+
+        branch_features = torch.cat([reliability, correction_scale], dim=-1)
+
         gate_in = torch.cat([
             state.unsqueeze(1).expand(B, M, self.latent_dim),
             prototypes.flatten(start_dim=2),
             branch_features,
         ], dim=-1)
-        mem_logits = self.gate(gate_in).squeeze(-1)
 
-        global_reliability = reliability.mean(dim=1)
-        global_disagreement = disagreement.mean(dim=1)
-        base_features = torch.cat([global_reliability, global_disagreement], dim=-1)
-        base_logit = self.base_gate(torch.cat([state, base_features], dim=-1)).squeeze(-1)
-        weights = torch.softmax(torch.cat([base_logit.unsqueeze(-1), mem_logits], dim=-1), dim=-1)
-        y_hat = weights[:, :1].unsqueeze(-1) * y_base
-        y_hat = y_hat + (weights[:, 1:].unsqueeze(-1).unsqueeze(-1) * y_mem).sum(dim=1)
-        return y_hat, weights
+        mem_logits = self.gate(gate_in).squeeze(-1)
+        mem_weights = torch.softmax(mem_logits, dim=-1)
+
+        conf_in = gate_in.mean(dim=1)
+        alpha = torch.sigmoid(self.conf_head(conf_in))
+
+        delta = (
+            mem_weights.unsqueeze(-1).unsqueeze(-1)
+            * delta_mem
+        ).sum(dim=1)
+
+        y_hat = y_base + alpha.unsqueeze(-1) * delta
+
+        effective_mem = alpha * mem_weights
+        effective_base = 1.0 - alpha
+        weights = torch.cat([effective_base, effective_mem], dim=-1)
+        stats = {
+            "alpha_mean": alpha.detach().mean(),
+            "alpha_max": alpha.detach().max(),
+            "delta_abs_mean": delta.detach().abs().mean(),
+            "effective_delta_abs_mean": (alpha.unsqueeze(-1) * delta).detach().abs().mean(),
+            "correction_scale_mean": correction_scale.detach().mean(),
+        }
+
+        return y_hat, weights, delta, alpha, stats
 
     def _forecast_normalized(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, future_y=None, query_index=None):
         norm_x, means, stdev = self._normalize(x_enc)
+
         y_base = self._base_forecast(
             norm_x,
+            x_enc=x_enc,
             x_mark_enc=x_mark_enc,
             x_dec=x_dec,
             x_mark_dec=x_mark_dec,
             means=means,
             stdev=stdev,
         )
+
+        # Pure base mode: do not pass through memory encoder / decoder / fusion.
+        if not self.use_memory:
+            self._last_aux_loss = None
+            self._last_memory_stats = None
+            return y_base, means, stdev
+
         state, key = self.state_encoder(norm_x)
         prototypes, reliability, branch_targets = self._discover_prototypes(key, query_index=query_index)
-        y_mem = self.memory_decoder(state, prototypes)
-        pred, weights = self._fusion(state, prototypes, reliability, y_base, y_mem)
+        delta_mem = self.memory_adapter(state, prototypes)
+        pred, weights, delta, alpha, stats = self._fusion(state, prototypes, reliability, y_base, delta_mem)
 
         self._last_aux_loss = None
+        self._last_memory_stats = stats
+
         if self.training and future_y is not None:
             if future_y.size(-1) != self.c_out:
                 future_y = future_y[:, :, -self.c_out:]
+
             norm_future = (future_y - means[:, :, -future_y.size(-1):]) / stdev[:, :, -future_y.size(-1):]
-            mem_target = branch_targets.detach() if branch_targets is not None else norm_future.unsqueeze(1)
-            branch_error = (y_mem - mem_target).pow(2).mean(dim=(2, 3))
+            delta_target = (norm_future - y_base).detach()
+            if self.delta_clamp > 0:
+                delta_target = delta_target.clamp(-self.delta_clamp, self.delta_clamp)
+            branch_error = (delta_mem - delta_target.unsqueeze(1)).pow(2).mean(dim=(2, 3))
+
             if self.mem_loss_type == "all":
                 mem_loss = branch_error.mean()
             elif self.mem_loss_type == "weighted":
                 mem_loss = (weights[:, 1:].detach() * branch_error).sum(dim=1).mean()
             else:
                 mem_loss = branch_error.min(dim=1).values.mean()
+
             aux_loss = self.mem_weight * mem_loss
-            if self.base_weight > 0:
-                aux_loss = aux_loss + self.base_weight * F.mse_loss(y_base, norm_future)
-            if self.traj_weight > 0:
-                pred_traj = self.traj_head(y_mem.flatten(start_dim=2)).view_as(prototypes)
-                aux_loss = aux_loss + self.traj_weight * F.mse_loss(pred_traj, prototypes.detach())
+            if self.alpha_weight > 0:
+                aux_loss = aux_loss + self.alpha_weight * alpha.mean()
+            if self.conflict_weight > 0:
+                aux_loss = aux_loss + self.conflict_weight * (alpha.unsqueeze(-1) * delta.abs()).mean()
+
             self._last_aux_loss = aux_loss
 
         return pred, means, stdev
 
     def get_auxiliary_loss(self):
         return self._last_aux_loss
+
+    def get_memory_stats(self):
+        return self._last_memory_stats
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, future_y=None, query_index=None):
         pred, means, stdev = self._forecast_normalized(
