@@ -14,9 +14,9 @@
 --wm_memory_warmup_epochs 0
 --wm_base_model dlinear
 --wm_base_type dlinear
---wm_freeze_base 0
+--wm_freeze_base 1
 --wm_mem_loss_type min
---wm_mem_weight 0.05
---wm_alpha_weight 0.01
+--wm_mem_weight 0.1
+--wm_alpha_weight 0.001
 --wm_conflict_weight 0.0
 --wm_delta_clamp 3.0

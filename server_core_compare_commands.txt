@@ -7,6 +7,9 @@
 #
 # Memory wrapper:
 #   --model BranchWorldModel --wm_base_model <BASE>
+#   For final frozen-backbone experiments, also pass:
+#   --wm_base_checkpoint /path/to/the/matching/base/checkpoint.pth
+#   Otherwise --wm_freeze_base 1 freezes a randomly initialized base.
 #
 # Change GPU in CUDA_VISIBLE_DEVICES and configs/benchmark/etth1_common.args if needed.
 
