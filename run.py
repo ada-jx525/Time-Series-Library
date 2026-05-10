@@ -172,6 +172,8 @@ if __name__ == '__main__':
                         help='number of future trajectory prototypes discovered per query')
     parser.add_argument('--wm_retrieve_k', type=int, default=64,
                         help='TopK state-neighbor count retrieved from memory')
+    parser.add_argument('--wm_exclusion_radius', type=int, default=-1,
+                        help='training retrieval excludes memory windows within this index gap; default seq_len+pred_len')
     parser.add_argument('--wm_memory_size', type=int, default=4096,
                         help='maximum number of training windows stored in memory')
     parser.add_argument('--wm_global_proto_num', type=int, default=32,
@@ -219,10 +221,14 @@ if __name__ == '__main__':
                         help='keeps adapter corrections close to retrieved base-residual memory context')
     parser.add_argument('--wm_alpha_weight', type=float, default=0.01,
                         help='memory usage penalty weight on mean confidence alpha')
+    parser.add_argument('--wm_force_alpha', type=float, default=-1.0,
+                        help='diagnostic only: >=0 forces the final memory alpha to this constant')
     parser.add_argument('--wm_confidence_weight', type=float, default=0.05,
                         help='oracle-improvement supervision weight for the memory confidence gate')
     parser.add_argument('--wm_confidence_temperature', type=float, default=0.02,
                         help='temperature for soft oracle gate labels from raw-scale MSE gain')
+    parser.add_argument('--wm_branch_oracle_weight', type=float, default=0.0,
+                        help='optional branch soft-oracle supervision weight from per-sample raw-scale gain')
     parser.add_argument('--wm_alpha_max', type=float, default=0.3,
                         help='maximum sample-wise memory usage after reliability gating')
     parser.add_argument('--wm_alpha_reliability_power', type=float, default=1.0,
@@ -249,6 +255,10 @@ if __name__ == '__main__':
                         help='print BranchWorld memory usage and base-vs-adapted diagnostic stats')
     parser.add_argument('--wm_log_interval', type=int, default=100,
                         help='training iteration interval for BranchWorld memory diagnostic logs')
+    parser.add_argument('--wm_rebuild_memory_before_val', type=int, choices=[0, 1], default=0,
+                        help='rebuild BranchWorld memory after each epoch before validation')
+    parser.add_argument('--eval_test_each_epoch', type=int, choices=[0, 1], default=1,
+                        help='debug option: evaluate test set every epoch; set 0 for formal final-only testing')
 
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:

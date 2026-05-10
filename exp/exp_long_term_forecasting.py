@@ -107,22 +107,44 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             "alpha_mean",
             "alpha_max",
             "raw_alpha_mean",
+            "raw_alpha_std",
             "reliability_gate_mean",
+            "reliability_gate_std",
             "residual_agreement_mean",
             "memory_residual_abs_mean",
             "delta_abs_mean",
             "effective_delta_abs_mean",
             "correction_scale_mean",
+            "branch_weight_max_mean",
+            "branch_weight_entropy",
+            "retrieval_top1_mean",
+            "retrieval_topk_mean",
+            "retrieval_topk_std",
+            "retrieval_excluded_frac",
+            "retrieval_empty_after_exclusion",
+            "retrieval_scarce_after_exclusion",
+            "retrieval_raw_top1_overlap",
+            "retrieval_raw_top1_gap_mean",
             "oracle_soft_mean",
             "oracle_hard_mean",
+            "oracle_gain_mean",
+            "oracle_gain_std",
             "gate_acc",
             "gate_auc",
+            "gate_gain_corr",
+            "reliability_gain_corr",
+            "branch_oracle_gain_mean",
+            "branch_oracle_entropy",
+            "branch_oracle_acc",
             "base_mse",
             "adapted_mse",
             "mse_gain",
             "base_mse_norm",
             "adapted_mse_norm",
             "mse_gain_norm",
+            "stdev_mean",
+            "stdev_min",
+            "stdev_p01",
         ]
         parts = []
         for key in ordered_keys:
@@ -321,8 +343,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
             train_memory_stats = self._average_memory_stats(epoch_memory_stats)
+            if bool(getattr(self.args, 'wm_rebuild_memory_before_val', 0)):
+                self._maybe_build_memory(train_loader, reason='post-epoch {} validation'.format(epoch + 1))
             vali_loss, vali_memory_stats = self.vali(vali_data, vali_loader, criterion, return_memory_stats=True)
-            test_loss, test_memory_stats = self.vali(test_data, test_loader, criterion, return_memory_stats=True)
+            if bool(getattr(self.args, 'eval_test_each_epoch', 1)):
+                test_loss, test_memory_stats = self.vali(test_data, test_loader, criterion, return_memory_stats=True)
+            else:
+                test_loss, test_memory_stats = float('nan'), None
 
             print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))

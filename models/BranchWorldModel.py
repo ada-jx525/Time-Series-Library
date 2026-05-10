@@ -78,6 +78,7 @@ class Model(nn.Module):
         self.latent_dim = getattr(configs, "wm_latent_dim", configs.d_model)
         self.branch_num = getattr(configs, "wm_branch_num", 3)
         self.retrieve_k = getattr(configs, "wm_retrieve_k", 64)
+        self.exclusion_radius = getattr(configs, "wm_exclusion_radius", -1)
         self.memory_size = getattr(configs, "wm_memory_size", 4096)
         self.global_proto_num = getattr(configs, "wm_global_proto_num", 32)
         self.prototype_mode = getattr(configs, "wm_proto_mode", "offline")
@@ -90,8 +91,10 @@ class Model(nn.Module):
         self.mem_weight = getattr(configs, "wm_mem_weight", 0.1)
         self.residual_context_weight = getattr(configs, "wm_residual_context_weight", 0.01)
         self.alpha_weight = getattr(configs, "wm_alpha_weight", 0.01)
+        self.force_alpha = getattr(configs, "wm_force_alpha", -1.0)
         self.confidence_weight = getattr(configs, "wm_confidence_weight", 0.05)
         self.confidence_temperature = getattr(configs, "wm_confidence_temperature", 0.02)
+        self.branch_oracle_weight = getattr(configs, "wm_branch_oracle_weight", 0.0)
         self.alpha_max = getattr(configs, "wm_alpha_max", 0.3)
         self.alpha_reliability_power = getattr(configs, "wm_alpha_reliability_power", 1.0)
         self.branch_temperature = getattr(configs, "wm_branch_temperature", 1.0)
@@ -185,6 +188,7 @@ class Model(nn.Module):
         nn.init.constant_(self.conf_head[-1].bias, -5.0)
         self._last_aux_loss = None
         self._last_memory_stats = None
+        self._last_retrieval_stats = None
 
         self.register_buffer("memory_keys", torch.empty(0, self.latent_dim), persistent=False)
         self.register_buffer("memory_states", torch.empty(0, self.latent_dim), persistent=False)
@@ -463,6 +467,16 @@ class Model(nn.Module):
         prototypes = state.new_zeros(B, self.branch_num, self.num_horizons, self.latent_dim)
         reliability = state.new_zeros(B, self.branch_num, self.reliability_dim)
         residual_context = state.new_zeros(B, self.branch_num, self.pred_len, self.c_out)
+        self._last_retrieval_stats = {
+            "retrieval_top1_mean": state.new_tensor(0.0),
+            "retrieval_topk_mean": state.new_tensor(0.0),
+            "retrieval_topk_std": state.new_tensor(0.0),
+            "retrieval_excluded_frac": state.new_tensor(0.0),
+            "retrieval_empty_after_exclusion": state.new_tensor(0.0),
+            "retrieval_scarce_after_exclusion": state.new_tensor(0.0),
+            "retrieval_raw_top1_overlap": state.new_tensor(0.0),
+            "retrieval_raw_top1_gap_mean": state.new_tensor(0.0),
+        }
         return prototypes, reliability, residual_context
 
     def _residual_reliability(self, residuals, target):
@@ -494,16 +508,46 @@ class Model(nn.Module):
         # unstable TopK/discrete-selection gradients leaking into the encoder.
         query_key = query_key.detach()
         sim_all = query_key @ self.memory_keys.t()
+        raw_top_score, raw_top_idx = sim_all.max(dim=-1)
+        excluded_frac = sim_all.new_tensor(0.0)
+        empty_frac = sim_all.new_tensor(0.0)
+        raw_top1_overlap = sim_all.new_tensor(0.0)
+        raw_top1_gap_mean = sim_all.new_tensor(0.0)
+        scarce_frac = sim_all.new_tensor(0.0)
         if self.training and query_index is not None and self.memory_indices.numel() == self.memory_keys.size(0):
-            exclusion_radius = self.seq_len + self.pred_len
+            exclusion_radius = self.exclusion_radius
+            if exclusion_radius < 0:
+                exclusion_radius = self.seq_len + self.pred_len
             query_index = query_index.to(sim_all.device).long()
             overlap = (query_index.unsqueeze(1) - self.memory_indices.unsqueeze(0)).abs() < exclusion_radius
+            excluded_frac = overlap.float().mean()
+            raw_top1_gap = (query_index - self.memory_indices[raw_top_idx]).abs().float()
+            raw_top1_gap_mean = raw_top1_gap.mean()
+            raw_top1_overlap = (raw_top1_gap < float(exclusion_radius)).float().mean()
             sim_all = sim_all.masked_fill(overlap, -torch.inf)
             empty = torch.isneginf(sim_all).all(dim=-1)
-            if empty.any():
-                fallback_sim = query_key[empty] @ self.memory_keys.t()
-                sim_all[empty] = fallback_sim
+            empty_frac = empty.float().mean()
+            valid_count = torch.isfinite(sim_all).sum(dim=-1)
+            scarce = valid_count < retrieve_k
+            scarce_frac = scarce.float().mean()
+            if scarce.any():
+                fallback_sim = query_key[scarce] @ self.memory_keys.t()
+                sim_all[scarce] = fallback_sim
         score, idx = torch.topk(sim_all, k=retrieve_k, dim=-1)
+        finite_score = score[torch.isfinite(score)]
+        if finite_score.numel() == 0:
+            finite_score = raw_top_score.new_zeros(1)
+        self._last_retrieval_stats = {
+            "retrieval_top1_mean": score[:, 0][torch.isfinite(score[:, 0])].mean()
+            if torch.isfinite(score[:, 0]).any() else raw_top_score.new_tensor(0.0),
+            "retrieval_topk_mean": finite_score.mean(),
+            "retrieval_topk_std": finite_score.std(unbiased=False),
+            "retrieval_excluded_frac": excluded_frac.detach(),
+            "retrieval_empty_after_exclusion": empty_frac.detach(),
+            "retrieval_scarce_after_exclusion": scarce_frac.detach(),
+            "retrieval_raw_top1_overlap": raw_top1_overlap.detach(),
+            "retrieval_raw_top1_gap_mean": raw_top1_gap_mean.detach(),
+        }
         neighbor_traj = self.memory_trajectories[idx]
         neighbor_residuals = self.memory_residuals[idx]
         neighbor_proto_ids = self.memory_proto_ids[idx]
@@ -684,7 +728,15 @@ class Model(nn.Module):
         if self.alpha_reliability_power != 1.0:
             reliability_score = reliability_score.pow(self.alpha_reliability_power)
         alpha_upper = (self.alpha_max * reliability_score).view(B, 1, 1)
-        alpha = alpha_upper * raw_alpha
+        if self.force_alpha >= 0:
+            forced = max(0.0, float(self.force_alpha))
+            alpha = raw_alpha.new_full((B, self.pred_len, self.c_out), forced)
+        else:
+            alpha = alpha_upper * raw_alpha
+
+        branch_scale = reliability[..., 4].clamp_min(1e-6).view(B, M, 1, 1)
+        branch_scale = (branch_scale * self.correction_scale).clamp_min(0.05)
+        branch_delta = torch.tanh(delta_mem / branch_scale.clamp_min(1e-6)) * branch_scale
 
         delta_raw = (
             mem_weights.unsqueeze(-1).unsqueeze(-1)
@@ -706,15 +758,23 @@ class Model(nn.Module):
             "alpha_mean": alpha.detach().mean(),
             "alpha_max": alpha.detach().max(),
             "raw_alpha_mean": raw_alpha.detach().mean(),
+            "raw_alpha_std": raw_alpha.detach().std(unbiased=False),
             "reliability_gate_mean": reliability_score.detach().mean(),
+            "reliability_gate_std": reliability_score.detach().std(unbiased=False),
             "residual_agreement_mean": reliability[..., 3].detach().mean(),
             "memory_residual_abs_mean": reliability[..., 4].detach().mean(),
             "delta_abs_mean": delta.detach().abs().mean(),
             "effective_delta_abs_mean": (alpha * delta).detach().abs().mean(),
             "correction_scale_mean": correction_scale.detach().mean(),
+            "branch_weight_max_mean": mem_weights.detach().max(dim=1).values.mean(),
+            "branch_weight_entropy": (
+                -(mem_weights.detach() * mem_weights.detach().clamp_min(1e-8).log()).sum(dim=1).mean()
+            ),
         }
+        if self._last_retrieval_stats:
+            stats.update(self._last_retrieval_stats)
 
-        return y_hat, weights, delta, alpha, raw_alpha, alpha_upper, stats
+        return y_hat, weights, mem_weights, delta, branch_delta, alpha, raw_alpha, alpha_upper, stats
 
     def _binary_auc(self, scores, labels):
         scores = scores.detach().flatten()
@@ -727,17 +787,46 @@ class Model(nn.Module):
         ties = (pos.unsqueeze(1) == neg.unsqueeze(0)).float() * 0.5
         return (cmp + ties).mean()
 
-    def _gate_oracle(self, y_base, delta, alpha_upper, future_y, means, stdev):
+    def _raw_sample_oracle(self, y_base, delta, future_y, means, stdev):
         y_base_raw = self._denormalize(y_base, means, stdev)
-        candidate = y_base + alpha_upper * delta.detach()
+        candidate = y_base + delta.detach()
         candidate_raw = self._denormalize(candidate, means, stdev)
-        base_err = (y_base_raw - future_y).pow(2)
-        candidate_err = (candidate_raw - future_y).pow(2)
+        base_err = (y_base_raw - future_y).pow(2).mean(dim=(1, 2))
+        candidate_err = (candidate_raw - future_y).pow(2).mean(dim=(1, 2))
         gain = base_err - candidate_err
         temperature = max(float(self.confidence_temperature), 1e-6)
         soft_oracle = torch.sigmoid(gain / temperature)
         hard_oracle = (gain > 0).float()
         return base_err, candidate_err, gain, soft_oracle, hard_oracle
+
+    def _raw_branch_oracle(self, y_base, branch_delta, future_y, means, stdev):
+        y_base_raw = self._denormalize(y_base, means, stdev)
+        base_err = (y_base_raw - future_y).pow(2).mean(dim=(1, 2))
+        B, M = branch_delta.shape[:2]
+        y_base_branch = y_base.unsqueeze(1).expand(B, M, self.pred_len, self.c_out)
+        candidate_raw = self._denormalize(
+            (y_base_branch + branch_delta.detach()).reshape(B * M, self.pred_len, self.c_out),
+            means.unsqueeze(1).expand(B, M, *means.shape[1:]).reshape(B * M, *means.shape[1:]),
+            stdev.unsqueeze(1).expand(B, M, *stdev.shape[1:]).reshape(B * M, *stdev.shape[1:]),
+        ).view(B, M, self.pred_len, self.c_out)
+        branch_err = (candidate_raw - future_y.unsqueeze(1)).pow(2).mean(dim=(2, 3))
+        gain = base_err.unsqueeze(1) - branch_err
+        temperature = max(float(self.confidence_temperature), 1e-6)
+        soft_oracle = torch.softmax(gain / temperature, dim=1)
+        hard_oracle = F.one_hot(gain.argmax(dim=1), num_classes=M).to(gain.dtype)
+        return base_err, branch_err, gain, soft_oracle, hard_oracle
+
+    def _corrcoef(self, x, y):
+        x = x.detach().flatten().float()
+        y = y.detach().flatten().float()
+        if x.numel() < 2 or y.numel() < 2:
+            return x.new_tensor(0.0)
+        x = x - x.mean()
+        y = y - y.mean()
+        denom = x.pow(2).mean().sqrt() * y.pow(2).mean().sqrt()
+        if denom <= 1e-12:
+            return x.new_tensor(0.0)
+        return (x * y).mean() / denom
 
     def _forecast_normalized(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, future_y=None, query_index=None):
         norm_x, means, stdev = self._normalize(x_enc)
@@ -761,7 +850,7 @@ class Model(nn.Module):
         state, key = self.state_encoder(norm_x)
         prototypes, reliability, residual_context = self._discover_prototypes(key, query_index=query_index)
         delta_mem = self.memory_adapter(state, prototypes, y_base.detach(), residual_context.detach())
-        pred, weights, delta, alpha, raw_alpha, alpha_upper, stats = self._fusion(
+        pred, weights, mem_weights, delta, branch_delta, alpha, raw_alpha, alpha_upper, stats = self._fusion(
             state, prototypes, reliability, y_base, delta_mem
         )
 
@@ -777,10 +866,17 @@ class Model(nn.Module):
             pred_raw = self._denormalize(pred, means, stdev)
             base_mse_raw = (y_base_raw - future_y).pow(2).mean()
             adapted_mse_raw = (pred_raw - future_y).pow(2).mean()
-            _, _, _, soft_oracle, hard_oracle = self._gate_oracle(
-                y_base, delta, alpha_upper, future_y, means, stdev
+            _, _, sample_gain, soft_oracle, hard_oracle = self._raw_sample_oracle(
+                y_base, delta, future_y, means, stdev
             )
-            gate_pred = (raw_alpha.detach() > 0.5).float()
+            _, _, branch_gain, branch_soft, branch_hard = self._raw_branch_oracle(
+                y_base, branch_delta, future_y, means, stdev
+            )
+            sample_raw_alpha = raw_alpha[:, 0, 0].detach()
+            reliability_sample = alpha_upper.view(alpha_upper.size(0)).detach()
+            branch_pred = mem_weights.detach().argmax(dim=1)
+            branch_label = branch_hard.argmax(dim=1)
+            stdev_y = stdev[..., -future_y.size(-1):]
             stats = dict(stats)
             stats.update({
                 "base_mse": base_mse_raw.detach(),
@@ -791,8 +887,20 @@ class Model(nn.Module):
                 "mse_gain_norm": (base_mse_norm - adapted_mse_norm).detach(),
                 "oracle_soft_mean": soft_oracle.detach().mean(),
                 "oracle_hard_mean": hard_oracle.detach().mean(),
-                "gate_acc": (gate_pred == hard_oracle).float().mean(),
-                "gate_auc": self._binary_auc(raw_alpha, hard_oracle),
+                "oracle_gain_mean": sample_gain.detach().mean(),
+                "oracle_gain_std": sample_gain.detach().std(unbiased=False),
+                "gate_acc": ((sample_raw_alpha > 0.5).float() == hard_oracle.detach()).float().mean(),
+                "gate_auc": self._binary_auc(sample_raw_alpha, hard_oracle),
+                "gate_gain_corr": self._corrcoef(sample_raw_alpha, sample_gain),
+                "reliability_gain_corr": self._corrcoef(reliability_sample, sample_gain),
+                "branch_oracle_gain_mean": branch_gain.detach().max(dim=1).values.mean(),
+                "branch_oracle_entropy": (
+                    -(branch_soft.detach() * branch_soft.detach().clamp_min(1e-8).log()).sum(dim=1).mean()
+                ),
+                "branch_oracle_acc": (branch_pred == branch_label).float().mean(),
+                "stdev_mean": stdev_y.detach().mean(),
+                "stdev_min": stdev_y.detach().min(),
+                "stdev_p01": torch.quantile(stdev_y.detach().flatten(), 0.01),
             })
         self._last_memory_stats = stats
 
@@ -817,16 +925,24 @@ class Model(nn.Module):
                 aux_loss = aux_loss + self.alpha_weight * alpha.mean()
             if self.confidence_weight > 0:
                 with torch.no_grad():
-                    _, _, _, confidence_target, _ = self._gate_oracle(
-                        y_base, delta, alpha_upper, future_y, means, stdev
+                    _, _, _, confidence_target, _ = self._raw_sample_oracle(
+                        y_base, delta, future_y, means, stdev
                     )
-                    confidence_target = confidence_target.mean(dim=(1, 2), keepdim=True)
-                    confidence_target = confidence_target.expand_as(raw_alpha)
+                    confidence_target = confidence_target.view(-1, 1, 1).expand_as(raw_alpha)
                 confidence_loss = F.binary_cross_entropy(
                     raw_alpha.clamp(1e-5, 1.0 - 1e-5),
                     confidence_target,
                 )
                 aux_loss = aux_loss + self.confidence_weight * confidence_loss
+            if self.branch_oracle_weight > 0:
+                with torch.no_grad():
+                    _, _, _, branch_target, _ = self._raw_branch_oracle(
+                        y_base, branch_delta, future_y, means, stdev
+                    )
+                branch_loss = -(
+                    branch_target * mem_weights.clamp_min(1e-8).log()
+                ).sum(dim=1).mean()
+                aux_loss = aux_loss + self.branch_oracle_weight * branch_loss
             if self.conflict_weight > 0:
                 aux_loss = aux_loss + self.conflict_weight * (alpha * delta.abs()).mean()
 
