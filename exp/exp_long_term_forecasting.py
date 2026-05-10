@@ -71,6 +71,65 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             return model_core.get_auxiliary_loss()
         return None
 
+    def _memory_stats(self):
+        if not bool(getattr(self.args, 'wm_log_stats', 1)):
+            return None
+        model_core = self._model_core()
+        if hasattr(model_core, 'get_memory_stats'):
+            return model_core.get_memory_stats()
+        return None
+
+    def _stats_to_float(self, stats):
+        if not stats:
+            return None
+        values = {}
+        for key, value in stats.items():
+            if torch.is_tensor(value):
+                values[key] = float(value.detach().float().cpu())
+            else:
+                values[key] = float(value)
+        return values
+
+    def _average_memory_stats(self, stats_list):
+        stats_list = [stats for stats in stats_list if stats]
+        if not stats_list:
+            return None
+        keys = sorted(set().union(*(stats.keys() for stats in stats_list)))
+        return {
+            key: float(np.mean([stats[key] for stats in stats_list if key in stats]))
+            for key in keys
+        }
+
+    def _format_memory_stats(self, stats):
+        if not stats:
+            return "memory: unavailable"
+        ordered_keys = [
+            "alpha_mean",
+            "alpha_max",
+            "raw_alpha_mean",
+            "reliability_gate_mean",
+            "residual_agreement_mean",
+            "memory_residual_abs_mean",
+            "delta_abs_mean",
+            "effective_delta_abs_mean",
+            "correction_scale_mean",
+            "oracle_soft_mean",
+            "oracle_hard_mean",
+            "gate_acc",
+            "gate_auc",
+            "base_mse",
+            "adapted_mse",
+            "mse_gain",
+            "base_mse_norm",
+            "adapted_mse_norm",
+            "mse_gain_norm",
+        ]
+        parts = []
+        for key in ordered_keys:
+            if key in stats:
+                parts.append("{}: {:.6f}".format(key, stats[key]))
+        return "memory | " + " ".join(parts)
+
     def _branchworld_extra_loss(self, outputs, targets):
         if self.args.model != 'BranchWorldModel':
             return outputs.new_tensor(0.0)
@@ -106,14 +165,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return criterion
  
 
-    def vali(self, vali_data, vali_loader, criterion):
+    def vali(self, vali_data, vali_loader, criterion, return_memory_stats=False):
         total_loss = []
+        memory_stats = []
         self.model.eval()
         with torch.no_grad():
             for i, batch in enumerate(vali_loader):
                 batch_x, batch_y, batch_x_mark, batch_y_mark, _ = self._unpack_batch(batch)
                 batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float()
+                batch_y = batch_y.float().to(self.device)
 
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
@@ -124,9 +184,18 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs = self._forward_model(
+                            batch_x, batch_x_mark, dec_inp, batch_y_mark,
+                            future_y=batch_y[:, -self.args.pred_len:, :].detach(),
+                        )
                 else:
-                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs = self._forward_model(
+                        batch_x, batch_x_mark, dec_inp, batch_y_mark,
+                        future_y=batch_y[:, -self.args.pred_len:, :].detach(),
+                    )
+                stats = self._stats_to_float(self._memory_stats())
+                if stats is not None:
+                    memory_stats.append(stats)
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
@@ -138,7 +207,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 total_loss.append(loss.item())
         total_loss = np.average(total_loss)
+        memory_stats = self._average_memory_stats(memory_stats)
         self.model.train()
+        if return_memory_stats:
+            return total_loss, memory_stats
         return total_loss
 
     def train(self, setting):
@@ -167,6 +239,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
             iter_count = 0
             train_loss = []
+            epoch_memory_stats = []
 
             self.model.train()
             epoch_time = time.time()
@@ -200,9 +273,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         loss = criterion(outputs, batch_y)
                         loss = loss + self._branchworld_extra_loss(outputs, batch_y)
                         aux_loss = self._auxiliary_loss()
-                        if aux_loss is not None:
-                            loss = loss + aux_loss
-                        train_loss.append(loss.item())
+                    if aux_loss is not None:
+                        loss = loss + aux_loss
+                    train_loss.append(loss.item())
+                    stats = self._stats_to_float(self._memory_stats())
+                    if stats is not None:
+                        epoch_memory_stats.append(stats)
                 else:
                     outputs = self._forward_model(
                         batch_x, batch_x_mark, dec_inp, batch_y_mark,
@@ -218,9 +294,16 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     if aux_loss is not None:
                         loss = loss + aux_loss
                     train_loss.append(loss.item())
+                    stats = self._stats_to_float(self._memory_stats())
+                    if stats is not None:
+                        epoch_memory_stats.append(stats)
 
-                if (i + 1) % 100 == 0:
+                log_interval = max(1, getattr(self.args, 'wm_log_interval', 100))
+                if (i + 1) % log_interval == 0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
+                    stats = self._stats_to_float(self._memory_stats())
+                    if stats is not None:
+                        print("\t{}".format(self._format_memory_stats(stats)))
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
                     print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
@@ -237,11 +320,18 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
-            vali_loss = self.vali(vali_data, vali_loader, criterion)
-            test_loss = self.vali(test_data, test_loader, criterion)
+            train_memory_stats = self._average_memory_stats(epoch_memory_stats)
+            vali_loss, vali_memory_stats = self.vali(vali_data, vali_loader, criterion, return_memory_stats=True)
+            test_loss, test_memory_stats = self.vali(test_data, test_loader, criterion, return_memory_stats=True)
 
             print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))
+            if train_memory_stats is not None:
+                print("Train {}".format(self._format_memory_stats(train_memory_stats)))
+            if vali_memory_stats is not None:
+                print("Vali  {}".format(self._format_memory_stats(vali_memory_stats)))
+            if test_memory_stats is not None:
+                print("Test  {}".format(self._format_memory_stats(test_memory_stats)))
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
@@ -270,6 +360,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             os.makedirs(folder_path)
 
         self.model.eval()
+        memory_stats = []
         with torch.no_grad():
             for i, batch in enumerate(test_loader):
                 batch_x, batch_y, batch_x_mark, batch_y_mark, _ = self._unpack_batch(batch)
@@ -285,9 +376,18 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs = self._forward_model(
+                            batch_x, batch_x_mark, dec_inp, batch_y_mark,
+                            future_y=batch_y[:, -self.args.pred_len:, :].detach(),
+                        )
                 else:
-                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs = self._forward_model(
+                        batch_x, batch_x_mark, dec_inp, batch_y_mark,
+                        future_y=batch_y[:, -self.args.pred_len:, :].detach(),
+                    )
+                stats = self._stats_to_float(self._memory_stats())
+                if stats is not None:
+                    memory_stats.append(stats)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, :]
@@ -346,6 +446,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             dtw = 'Not calculated'
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
+        memory_stats = self._average_memory_stats(memory_stats)
+        if memory_stats is not None:
+            print("Test {}".format(self._format_memory_stats(memory_stats)))
         print('mse:{}, mae:{}, dtw:{}'.format(mse, mae, dtw))
         f = open("result_long_term_forecast.txt", 'a')
         f.write(setting + "  \n")

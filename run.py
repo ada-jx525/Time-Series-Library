@@ -215,8 +215,24 @@ if __name__ == '__main__':
                         help='adapter residual auxiliary loss: min-over-branches, all branches, or gate-weighted')
     parser.add_argument('--wm_mem_weight', type=float, default=0.1,
                         help='adapter residual auxiliary loss weight')
+    parser.add_argument('--wm_residual_context_weight', type=float, default=0.01,
+                        help='keeps adapter corrections close to retrieved base-residual memory context')
     parser.add_argument('--wm_alpha_weight', type=float, default=0.01,
                         help='memory usage penalty weight on mean confidence alpha')
+    parser.add_argument('--wm_confidence_weight', type=float, default=0.05,
+                        help='oracle-improvement supervision weight for the memory confidence gate')
+    parser.add_argument('--wm_confidence_temperature', type=float, default=0.02,
+                        help='temperature for soft oracle gate labels from raw-scale MSE gain')
+    parser.add_argument('--wm_alpha_max', type=float, default=0.3,
+                        help='maximum sample-wise memory usage after reliability gating')
+    parser.add_argument('--wm_alpha_reliability_power', type=float, default=1.0,
+                        help='power applied to retrieval/prototype/residual reliability before scaling alpha')
+    parser.add_argument('--wm_branch_temperature', type=float, default=1.0,
+                        help='temperature for prototype branch softmax fusion')
+    parser.add_argument('--wm_branch_dropout', type=float, default=0.1,
+                        help='dropout probability applied to prototype branch weights during training')
+    parser.add_argument('--wm_correction_scale', type=float, default=1.0,
+                        help='scale multiplier for tanh-limited fused memory correction')
     parser.add_argument('--wm_conflict_weight', type=float, default=0.0,
                         help='optional penalty on alpha-scaled correction magnitude')
     parser.add_argument('--wm_delta_clamp', type=float, default=3.0,
@@ -229,6 +245,10 @@ if __name__ == '__main__':
                         help='optional MAE term added to final prediction loss')
     parser.add_argument('--wm_freq_loss_weight', type=float, default=0.0,
                         help='optional frequency-domain loss weight for final prediction')
+    parser.add_argument('--wm_log_stats', type=int, choices=[0, 1], default=1,
+                        help='print BranchWorld memory usage and base-vs-adapted diagnostic stats')
+    parser.add_argument('--wm_log_interval', type=int, default=100,
+                        help='training iteration interval for BranchWorld memory diagnostic logs')
 
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:

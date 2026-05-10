@@ -17,6 +17,14 @@
 --wm_freeze_base 1
 --wm_mem_loss_type min
 --wm_mem_weight 0.1
---wm_alpha_weight 0.001
---wm_conflict_weight 0.0
+--wm_residual_context_weight 0.01
+--wm_alpha_weight 0.01
+--wm_confidence_weight 0.05
+--wm_confidence_temperature 0.02
+--wm_alpha_max 0.3
+--wm_alpha_reliability_power 1.0
+--wm_branch_temperature 1.0
+--wm_branch_dropout 0.1
+--wm_correction_scale 1.0
+--wm_conflict_weight 0.01
 --wm_delta_clamp 3.0

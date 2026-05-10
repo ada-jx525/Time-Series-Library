@@ -153,24 +153,41 @@ class LatentStateEncoder(nn.Module):
     state = s_i: 用于 decoder / rollout / trajectory construction
     key   = k_i: 用于 memory retrieval
     """
-    def __init__(self, c_in, seq_len, latent_dim, dropout):
+    def __init__(
+        self,
+        c_in,
+        seq_len,
+        latent_dim,
+        dropout,
+        d_model=None,
+        n_heads=4,
+        d_ff=None,
+        e_layers=2,
+        backbone="patch_transformer",
+        patch_len=16,
+        patch_stride=None,
+    ):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv1d(c_in, latent_dim, kernel_size=8, stride=4, padding=2),
-            nn.GELU(),
-            nn.Conv1d(latent_dim, latent_dim, kernel_size=4, stride=2, padding=1),
-            nn.GELU(),
-            nn.Conv1d(latent_dim, latent_dim, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-            nn.AdaptiveAvgPool1d(1),
+        d_model = d_model or latent_dim
+        d_ff = d_ff or max(4 * d_model, latent_dim)
+        self.backbone = StateBackbone(
+            c_in=c_in,
+            seq_len=seq_len,
+            d_model=d_model,
+            n_heads=n_heads,
+            d_ff=d_ff,
+            e_layers=e_layers,
+            dropout=dropout,
+            backbone=backbone,
+            patch_len=patch_len,
+            patch_stride=patch_stride,
         )
-        self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.LayerNorm(latent_dim),
-            nn.Linear(latent_dim, latent_dim),
+        self.state_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, latent_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.LayerNorm(latent_dim),   # state 尺度稳定
+            nn.LayerNorm(latent_dim),
         )
         self.key_head = nn.Sequential(
             nn.LayerNorm(latent_dim),
@@ -179,8 +196,7 @@ class LatentStateEncoder(nn.Module):
 
     def forward(self, x):
         # x: (B, seq_len, c_in)
-        x = x.permute(0, 2, 1).contiguous()
-        state = self.head(self.encoder(x))
+        state = self.state_head(self.backbone(x))
         key = F.normalize(self.key_head(state), dim=-1)
         return state, key
 
@@ -188,9 +204,25 @@ class LatentStateEncoder(nn.Module):
 class MemoryBranchDecoder(nn.Module):
     def __init__(self, latent_dim, num_horizons, pred_len, c_out, hidden_dim, dropout):
         super().__init__()
-        in_dim = latent_dim * (num_horizons + 1)
+        context_dim = latent_dim * (num_horizons + 1)
         self.pred_len = pred_len
         self.c_out = c_out
+        summary_dim = 4 * c_out
+        self.y_base_encoder = nn.Sequential(
+            nn.LayerNorm(summary_dim),
+            nn.Linear(summary_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self.residual_encoder = nn.Sequential(
+            nn.LayerNorm(summary_dim),
+            nn.Linear(summary_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        in_dim = context_dim + 2 * latent_dim + 2
         self.input = nn.Sequential(
             nn.LayerNorm(in_dim),
             nn.Linear(in_dim, hidden_dim),
@@ -201,15 +233,47 @@ class MemoryBranchDecoder(nn.Module):
         )
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.out = nn.Linear(hidden_dim, pred_len * c_out)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+        self.gain = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
+        )
 
-    def forward(self, state, prototypes):
+    def _series_summary(self, x):
+        mean = x.mean(dim=1)
+        slope = x[:, -1] - x[:, 0]
+        abs_mean = x.abs().mean(dim=1)
+        std = torch.sqrt(torch.var(x, dim=1, unbiased=False) + 1e-5)
+        return torch.cat([mean, slope, abs_mean, std], dim=-1)
+
+    def forward(self, state, prototypes, y_base, residual_context):
         B, M, S, Z = prototypes.shape
         state_ctx = state.unsqueeze(1).expand(B, M, Z)
         future_states = state_ctx.unsqueeze(2) + prototypes
-        x = torch.cat([state_ctx, future_states.flatten(start_dim=2)], dim=-1)
+        y_base_ctx = self.y_base_encoder(self._series_summary(y_base)).unsqueeze(1).expand(B, M, Z)
+        residual_ctx = self.residual_encoder(
+            self._series_summary(residual_context.flatten(start_dim=0, end_dim=1))
+        ).view(B, M, Z)
+        residual_stats = torch.stack([
+            residual_context.mean(dim=(2, 3)),
+            residual_context.abs().mean(dim=(2, 3)),
+        ], dim=-1)
+        x = torch.cat([
+            state_ctx,
+            future_states.flatten(start_dim=2),
+            y_base_ctx,
+            residual_ctx,
+            residual_stats,
+        ], dim=-1)
         h = self.blocks(self.input(x))
-        y = self.out(self.out_norm(h))
-        return y.view(B, M, self.pred_len, self.c_out)
+        residual_scale = residual_context.abs().mean(dim=(2, 3), keepdim=True).clamp_min(0.05)
+        learned_residual = torch.tanh(
+            self.out(self.out_norm(h)).view(B, M, self.pred_len, self.c_out)
+        ) * residual_scale
+        gain = self.gain(h).view(B, M, 1, 1)
+        return residual_context + gain * learned_residual
 
 
 def make_transformer_encoder(d_model, n_heads, d_ff, e_layers, dropout):

@@ -1,62 +1,61 @@
-# Core server comparison commands: each base model w/o memory vs w/ offline memory.
-# Run from repository root. Each command is independent and prints live logs.
+# Server core comparison commands: baseline checkpoint first, then base-aware memory.
+# Run from repository root.
 #
-# Formal setting:
-#   configs/benchmark/etth1_common.args       -> train_epochs=150, patience=10
-#   configs/benchmark/branchworld_common.args -> offline memory defaults
+# Important:
+#   1. For each base model and pred_len, run the baseline command first.
+#   2. The memory command loads the matching trained baseline via --wm_base_checkpoint.
+#   3. Do not run the memory command before its baseline checkpoint exists.
 #
-# Memory wrapper:
-#   --model BranchWorldModel --wm_base_model <BASE>
-#   For final frozen-backbone experiments, also pass:
-#   --wm_base_checkpoint /path/to/the/matching/base/checkpoint.pth
-#   Otherwise --wm_freeze_base 1 freezes a randomly initialized base.
+# Shared formal setting:
+#   configs/benchmark/etth1_common.args       -> ETTh1, seq_len=96, train_epochs=150, patience=10
+#   configs/benchmark/branchworld_common.args -> BranchWorld memory defaults, wm_freeze_base=1
 #
-# Change GPU in CUDA_VISIBLE_DEVICES and configs/benchmark/etth1_common.args if needed.
+# To use another GPU, change CUDA_VISIBLE_DEVICES and --gpu in configs/benchmark/etth1_common.args.
 
 # =========================
 # pred_len = 96
 # =========================
 CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model DLinear --pred_len 96 --model_id ETTh1_96_96_DLinear_wo_memory --des dlinear_wo_memory
-CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 96 --model_id ETTh1_96_96_DLinear_with_memory --wm_base_model dlinear --wm_proto_mode offline --des dlinear_with_memory
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 96 --model_id ETTh1_96_96_DLinear_with_memory --wm_base_model DLinear --wm_base_checkpoint ./checkpoints/long_term_forecast_ETTh1_96_96_DLinear_wo_memory_DLinear_ETTh1_ftM_sl96_ll48_pl96_dm128_nh4_el2_dl1_df256_expand2_dc4_fc3_ebtimeF_dtTrue_dlinear_wo_memory_0/checkpoint.pth --wm_proto_mode offline --des dlinear_with_memory
 
 CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model PatchTST --pred_len 96 --model_id ETTh1_96_96_PatchTST_wo_memory --des patchtst_wo_memory
-CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 96 --model_id ETTh1_96_96_PatchTST_with_memory --wm_base_model PatchTST --wm_proto_mode offline --des patchtst_with_memory
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 96 --model_id ETTh1_96_96_PatchTST_with_memory --wm_base_model PatchTST --wm_base_checkpoint ./checkpoints/long_term_forecast_ETTh1_96_96_PatchTST_wo_memory_PatchTST_ETTh1_ftM_sl96_ll48_pl96_dm128_nh4_el2_dl1_df256_expand2_dc4_fc3_ebtimeF_dtTrue_patchtst_wo_memory_0/checkpoint.pth --wm_proto_mode offline --des patchtst_with_memory
 
 CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model iTransformer --pred_len 96 --model_id ETTh1_96_96_iTransformer_wo_memory --des itransformer_wo_memory
-CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 96 --model_id ETTh1_96_96_iTransformer_with_memory --wm_base_model iTransformer --wm_proto_mode offline --des itransformer_with_memory
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 96 --model_id ETTh1_96_96_iTransformer_with_memory --wm_base_model iTransformer --wm_base_checkpoint ./checkpoints/long_term_forecast_ETTh1_96_96_iTransformer_wo_memory_iTransformer_ETTh1_ftM_sl96_ll48_pl96_dm128_nh4_el2_dl1_df256_expand2_dc4_fc3_ebtimeF_dtTrue_itransformer_wo_memory_0/checkpoint.pth --wm_proto_mode offline --des itransformer_with_memory
 
 # =========================
 # pred_len = 192
 # =========================
 CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model DLinear --pred_len 192 --model_id ETTh1_96_192_DLinear_wo_memory --des dlinear_wo_memory
-CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 192 --model_id ETTh1_96_192_DLinear_with_memory --wm_base_model dlinear --wm_proto_mode offline --des dlinear_with_memory
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 192 --model_id ETTh1_96_192_DLinear_with_memory --wm_base_model DLinear --wm_base_checkpoint ./checkpoints/long_term_forecast_ETTh1_96_192_DLinear_wo_memory_DLinear_ETTh1_ftM_sl96_ll48_pl192_dm128_nh4_el2_dl1_df256_expand2_dc4_fc3_ebtimeF_dtTrue_dlinear_wo_memory_0/checkpoint.pth --wm_proto_mode offline --des dlinear_with_memory
 
 CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model PatchTST --pred_len 192 --model_id ETTh1_96_192_PatchTST_wo_memory --des patchtst_wo_memory
-CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 192 --model_id ETTh1_96_192_PatchTST_with_memory --wm_base_model PatchTST --wm_proto_mode offline --des patchtst_with_memory
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 192 --model_id ETTh1_96_192_PatchTST_with_memory --wm_base_model PatchTST --wm_base_checkpoint ./checkpoints/long_term_forecast_ETTh1_96_192_PatchTST_wo_memory_PatchTST_ETTh1_ftM_sl96_ll48_pl192_dm128_nh4_el2_dl1_df256_expand2_dc4_fc3_ebtimeF_dtTrue_patchtst_wo_memory_0/checkpoint.pth --wm_proto_mode offline --des patchtst_with_memory
 
 CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model iTransformer --pred_len 192 --model_id ETTh1_96_192_iTransformer_wo_memory --des itransformer_wo_memory
-CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 192 --model_id ETTh1_96_192_iTransformer_with_memory --wm_base_model iTransformer --wm_proto_mode offline --des itransformer_with_memory
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 192 --model_id ETTh1_96_192_iTransformer_with_memory --wm_base_model iTransformer --wm_base_checkpoint ./checkpoints/long_term_forecast_ETTh1_96_192_iTransformer_wo_memory_iTransformer_ETTh1_ftM_sl96_ll48_pl192_dm128_nh4_el2_dl1_df256_expand2_dc4_fc3_ebtimeF_dtTrue_itransformer_wo_memory_0/checkpoint.pth --wm_proto_mode offline --des itransformer_with_memory
 
 # =========================
 # pred_len = 336
 # =========================
 CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model DLinear --pred_len 336 --model_id ETTh1_96_336_DLinear_wo_memory --des dlinear_wo_memory
-CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 336 --model_id ETTh1_96_336_DLinear_with_memory --wm_base_model dlinear --wm_proto_mode offline --des dlinear_with_memory
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 336 --model_id ETTh1_96_336_DLinear_with_memory --wm_base_model DLinear --wm_base_checkpoint ./checkpoints/long_term_forecast_ETTh1_96_336_DLinear_wo_memory_DLinear_ETTh1_ftM_sl96_ll48_pl336_dm128_nh4_el2_dl1_df256_expand2_dc4_fc3_ebtimeF_dtTrue_dlinear_wo_memory_0/checkpoint.pth --wm_proto_mode offline --des dlinear_with_memory
 
 CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model PatchTST --pred_len 336 --model_id ETTh1_96_336_PatchTST_wo_memory --des patchtst_wo_memory
-CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 336 --model_id ETTh1_96_336_PatchTST_with_memory --wm_base_model PatchTST --wm_proto_mode offline --des patchtst_with_memory
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 336 --model_id ETTh1_96_336_PatchTST_with_memory --wm_base_model PatchTST --wm_base_checkpoint ./checkpoints/long_term_forecast_ETTh1_96_336_PatchTST_wo_memory_PatchTST_ETTh1_ftM_sl96_ll48_pl336_dm128_nh4_el2_dl1_df256_expand2_dc4_fc3_ebtimeF_dtTrue_patchtst_wo_memory_0/checkpoint.pth --wm_proto_mode offline --des patchtst_with_memory
 
 CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model iTransformer --pred_len 336 --model_id ETTh1_96_336_iTransformer_wo_memory --des itransformer_wo_memory
-CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 336 --model_id ETTh1_96_336_iTransformer_with_memory --wm_base_model iTransformer --wm_proto_mode offline --des itransformer_with_memory
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 336 --model_id ETTh1_96_336_iTransformer_with_memory --wm_base_model iTransformer --wm_base_checkpoint ./checkpoints/long_term_forecast_ETTh1_96_336_iTransformer_wo_memory_iTransformer_ETTh1_ftM_sl96_ll48_pl336_dm128_nh4_el2_dl1_df256_expand2_dc4_fc3_ebtimeF_dtTrue_itransformer_wo_memory_0/checkpoint.pth --wm_proto_mode offline --des itransformer_with_memory
 
 # =========================
 # pred_len = 720
 # =========================
 CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model DLinear --pred_len 720 --model_id ETTh1_96_720_DLinear_wo_memory --des dlinear_wo_memory
-CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 720 --model_id ETTh1_96_720_DLinear_with_memory --wm_base_model dlinear --wm_proto_mode offline --des dlinear_with_memory
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 720 --model_id ETTh1_96_720_DLinear_with_memory --wm_base_model DLinear --wm_base_checkpoint ./checkpoints/long_term_forecast_ETTh1_96_720_DLinear_wo_memory_DLinear_ETTh1_ftM_sl96_ll48_pl720_dm128_nh4_el2_dl1_df256_expand2_dc4_fc3_ebtimeF_dtTrue_dlinear_wo_memory_0/checkpoint.pth --wm_proto_mode offline --des dlinear_with_memory
 
 CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model PatchTST --pred_len 720 --model_id ETTh1_96_720_PatchTST_wo_memory --des patchtst_wo_memory
-CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 720 --model_id ETTh1_96_720_PatchTST_with_memory --wm_base_model PatchTST --wm_proto_mode offline --des patchtst_with_memory
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 720 --model_id ETTh1_96_720_PatchTST_with_memory --wm_base_model PatchTST --wm_base_checkpoint ./checkpoints/long_term_forecast_ETTh1_96_720_PatchTST_wo_memory_PatchTST_ETTh1_ftM_sl96_ll48_pl720_dm128_nh4_el2_dl1_df256_expand2_dc4_fc3_ebtimeF_dtTrue_patchtst_wo_memory_0/checkpoint.pth --wm_proto_mode offline --des patchtst_with_memory
 
 CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args --model iTransformer --pred_len 720 --model_id ETTh1_96_720_iTransformer_wo_memory --des itransformer_wo_memory
-CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 720 --model_id ETTh1_96_720_iTransformer_with_memory --wm_base_model iTransformer --wm_proto_mode offline --des itransformer_with_memory
+CUDA_VISIBLE_DEVICES=0 python -u run.py @configs/benchmark/etth1_common.args @configs/benchmark/branchworld_common.args --pred_len 720 --model_id ETTh1_96_720_iTransformer_with_memory --wm_base_model iTransformer --wm_base_checkpoint ./checkpoints/long_term_forecast_ETTh1_96_720_iTransformer_wo_memory_iTransformer_ETTh1_ftM_sl96_ll48_pl720_dm128_nh4_el2_dl1_df256_expand2_dc4_fc3_ebtimeF_dtTrue_itransformer_wo_memory_0/checkpoint.pth --wm_proto_mode offline --des itransformer_with_memory
