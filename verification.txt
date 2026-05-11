@@ -1,0 +1,39 @@
+正确服务器流程
+先训练 PatchTST base
+python -u run.py \
+  @configs/benchmark/etth1_common.args \
+  --model PatchTST \
+  --model_id etth1_96_patchtst_base_gpu \
+  --des patchtst_base_gpu \
+  --train_epochs 10 \
+  --patience 3 \
+  --use_gpu 1 \
+  --gpu 0
+
+
+找到 checkpoint
+find checkpoints -name checkpoint.pth | grep patchtst_base_gpu
+加载 PatchTST checkpoint 跑 BranchWorld
+BASE=checkpoints/你的_patchtst_checkpoint路径/checkpoint.pth
+
+python -u run.py \
+  @configs/benchmark/etth1_common.args \
+  @configs/benchmark/branchworld_common.args \
+  --model BranchWorldModel \
+  --model_id etth1_96_k16_patchtst_branchworld_gpu \
+  --des k16_patchtst_branchworld_gpu \
+  --wm_base_checkpoint "$BASE" \
+  --wm_base_model PatchTST \
+  --wm_use_memory 1 \
+  --wm_attention_mode linear \
+  --wm_predictor_type linear \
+  --wm_predictor_context z0 \
+  --wm_predictor_loss mse \
+  --wm_num_clusters 16 \
+  --wm_correction_lambda 0.1 \
+  --wm_residual_encoder identity \
+  --learning_rate 0.05 \
+  --train_epochs 8 \
+  --patience 8 \
+  --use_gpu 1 \
+  --gpu 0

@@ -104,47 +104,23 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if not stats:
             return "memory: unavailable"
         ordered_keys = [
-            "alpha_mean",
-            "alpha_max",
-            "raw_alpha_mean",
-            "raw_alpha_std",
-            "reliability_gate_mean",
-            "reliability_gate_std",
-            "residual_agreement_mean",
-            "memory_residual_abs_mean",
-            "delta_abs_mean",
-            "effective_delta_abs_mean",
-            "correction_scale_mean",
-            "branch_weight_max_mean",
-            "branch_weight_entropy",
-            "retrieval_top1_mean",
-            "retrieval_topk_mean",
-            "retrieval_topk_std",
-            "retrieval_excluded_frac",
-            "retrieval_empty_after_exclusion",
-            "retrieval_scarce_after_exclusion",
-            "retrieval_raw_top1_overlap",
-            "retrieval_raw_top1_gap_mean",
-            "oracle_soft_mean",
-            "oracle_hard_mean",
-            "oracle_gain_mean",
-            "oracle_gain_std",
-            "gate_acc",
-            "gate_auc",
-            "gate_gain_corr",
-            "reliability_gain_corr",
-            "branch_oracle_gain_mean",
-            "branch_oracle_entropy",
-            "branch_oracle_acc",
+            "memory_ready",
+            "prototype_count",
+            "linear_attention",
+            "oracle_attention",
+            "correction_lambda",
+            "correction_abs_mean",
+            "effective_correction_abs_mean",
+            "prototype_weight_max_mean",
+            "prototype_weight_entropy",
+            "predictor_ce",
+            "predictor_acc",
             "base_mse",
             "adapted_mse",
             "mse_gain",
             "base_mse_norm",
             "adapted_mse_norm",
             "mse_gain_norm",
-            "stdev_mean",
-            "stdev_min",
-            "stdev_p01",
         ]
         parts = []
         for key in ordered_keys:
@@ -333,12 +309,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     time_now = time.time()
 
                 if self.args.use_amp:
-                    scaler.scale(loss).backward()
-                    scaler.step(model_optim)
-                    scaler.update()
+                    if loss.requires_grad:
+                        scaler.scale(loss).backward()
+                        scaler.step(model_optim)
+                        scaler.update()
                 else:
-                    loss.backward()
-                    model_optim.step()
+                    if loss.requires_grad:
+                        loss.backward()
+                        model_optim.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)

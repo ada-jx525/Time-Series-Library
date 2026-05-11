@@ -165,35 +165,21 @@ if __name__ == '__main__':
     parser.add_argument('--top_p', type=float, default=0.5, help='Dynamic Routing in MoE')
     parser.add_argument('--pos', type=int, choices=[0, 1], default=1, help='Positional Embedding. Set pos to 0 or 1')
 
-    # BranchWorldModel: world-trajectory memory enhancement module
+    # BranchWorldModel: minimal latent-trajectory prototype memory correction
     parser.add_argument('--wm_latent_dim', type=int, default=256,
                         help='latent state dimension for trajectory memory')
-    parser.add_argument('--wm_branch_num', type=int, default=3,
-                        help='number of future trajectory prototypes discovered per query')
-    parser.add_argument('--wm_retrieve_k', type=int, default=64,
-                        help='TopK state-neighbor count retrieved from memory')
-    parser.add_argument('--wm_exclusion_radius', type=int, default=-1,
-                        help='training retrieval excludes memory windows within this index gap; default seq_len+pred_len')
     parser.add_argument('--wm_memory_size', type=int, default=4096,
                         help='maximum number of training windows stored in memory')
     parser.add_argument('--wm_global_proto_num', type=int, default=32,
                         help='number of offline latent dynamics prototypes in the global bank')
-    parser.add_argument('--wm_proto_mode', type=str, choices=['offline', 'local'], default='offline',
-                        help='offline selects from global prototype bank; local uses query-local k-means as ablation')
     parser.add_argument('--wm_kmeans_iters', type=int, default=8,
                         help='k-means iterations for offline global trajectory prototype learning')
-    parser.add_argument('--wm_proto_refine_iters', type=int, default=2,
-                        help='reserved iterations for future query-local prototype refinement variant')
-    parser.add_argument('--wm_proto_state_alpha', type=float, default=1.0,
-                        help='state-similarity exponent in reliability weighting')
-    parser.add_argument('--wm_proto_traj_beta', type=float, default=2.0,
-                        help='trajectory-compactness exponent in reliability weighting')
     parser.add_argument('--wm_horizons', type=int, nargs='*', default=None,
                         help='future checkpoints for latent displacement memory; default: H/4 H/2 3H/4 H')
     parser.add_argument('--wm_use_memory', type=int, choices=[0, 1], default=1,
-                        help='use trajectory memory; 0 uses only zero-memory prototypes plus base expert')
-    parser.add_argument('--wm_use_branch_discovery', type=int, choices=[0, 1], default=1,
-                        help='1 selects branches from offline prototype bank; 0 uses selected raw trajectories')
+                        help='use trajectory memory correction; 0 uses only the base forecaster')
+    parser.add_argument('--wm_attention_mode', type=str, choices=['dot', 'linear', 'oracle'], default='dot',
+                        help='dot uses prototype-key similarity; linear predicts prototype weights; oracle uses true trajectory cluster labels')
     parser.add_argument('--wm_backbone', type=str, default='patch_transformer',
                         choices=['temporal_transformer', 'patch_transformer', 'inverted_transformer', 'tcn', 'mlp'],
                         help='latent state encoder backbone')
@@ -213,40 +199,38 @@ if __name__ == '__main__':
                         help='optional checkpoint path loaded into the BranchWorld base forecaster before freezing/training')
     parser.add_argument('--wm_freeze_base', type=int, choices=[0, 1], default=1,
                         help='freeze y_base forecaster while training memory module')
-    parser.add_argument('--wm_mem_loss_type', type=str, choices=['min', 'all', 'weighted'], default='min',
-                        help='adapter residual auxiliary loss: min-over-branches, all branches, or gate-weighted')
-    parser.add_argument('--wm_mem_weight', type=float, default=0.1,
-                        help='adapter residual auxiliary loss weight')
-    parser.add_argument('--wm_residual_context_weight', type=float, default=0.01,
-                        help='keeps adapter corrections close to retrieved base-residual memory context')
-    parser.add_argument('--wm_alpha_weight', type=float, default=0.01,
-                        help='memory usage penalty weight on mean confidence alpha')
-    parser.add_argument('--wm_force_alpha', type=float, default=-1.0,
-                        help='diagnostic only: >=0 forces the final memory alpha to this constant')
-    parser.add_argument('--wm_confidence_weight', type=float, default=0.05,
-                        help='oracle-improvement supervision weight for the memory confidence gate')
-    parser.add_argument('--wm_confidence_temperature', type=float, default=0.02,
-                        help='temperature for soft oracle gate labels from raw-scale MSE gain')
-    parser.add_argument('--wm_branch_oracle_weight', type=float, default=0.0,
-                        help='optional branch soft-oracle supervision weight from per-sample raw-scale gain')
-    parser.add_argument('--wm_alpha_max', type=float, default=0.3,
-                        help='maximum sample-wise memory usage after reliability gating')
-    parser.add_argument('--wm_alpha_reliability_power', type=float, default=1.0,
-                        help='power applied to retrieval/prototype/residual reliability before scaling alpha')
+    parser.add_argument('--wm_freeze_encoder', type=int, choices=[0, 1], default=1,
+                        help='freeze latent trajectory encoder for first-stage memory diagnostics')
+    parser.add_argument('--wm_correction_lambda', type=float, default=0.1,
+                        help='fixed multiplier for prototype residual correction')
+    parser.add_argument('--wm_predictor_ce_weight', type=float, default=1.0,
+                        help='cross-entropy weight for linear cluster predictor')
+    parser.add_argument('--wm_predictor_ce_only', type=int, choices=[0, 1], default=1,
+                        help='1 trains linear predictor only with cluster-label CE, not prediction MSE')
+    parser.add_argument('--wm_predictor_loss', type=str, choices=['ce', 'mse'], default='ce',
+                        help='ce trains linear predictor on trajectory cluster labels; mse trains it through final prediction loss')
+    parser.add_argument('--wm_predictor_checkpoint', type=str, default='',
+                        help='optional checkpoint path loaded into cluster_predictor before training')
+    parser.add_argument('--wm_predictor_entropy_weight', type=float, default=0.0,
+                        help='optional entropy reward weight for MSE-trained linear predictor; positive values discourage overly sharp weights')
+    parser.add_argument('--wm_predictor_context', type=str, choices=['z0', 'summary'], default='z0',
+                        help='predictor input features: z0 uses only latent key; summary adds current-window and base-forecast statistics')
+    parser.add_argument('--wm_predictor_type', type=str, choices=['linear', 'mlp'], default='linear',
+                        help='predictor architecture for prototype logits')
+    parser.add_argument('--wm_predictor_hidden_dim', type=int, default=128,
+                        help='hidden dimension for --wm_predictor_type mlp')
+    parser.add_argument('--wm_residual_encoder', type=str, choices=['identity', 'linear', 'mlp'], default='identity',
+                        help='learned residual-aware projection applied to z0 before prototype prediction')
+    parser.add_argument('--wm_residual_latent_dim', type=int, default=128,
+                        help='output dimension for learned residual-aware z0 projection')
+    parser.add_argument('--wm_residual_hidden_dim', type=int, default=128,
+                        help='hidden dimension for --wm_residual_encoder mlp')
+    parser.add_argument('--wm_hard_selection', type=int, choices=[0, 1], default=0,
+                        help='use argmax one-hot prototype selection instead of soft weights')
     parser.add_argument('--wm_branch_temperature', type=float, default=1.0,
-                        help='temperature for prototype branch softmax fusion')
-    parser.add_argument('--wm_branch_dropout', type=float, default=0.1,
-                        help='dropout probability applied to prototype branch weights during training')
-    parser.add_argument('--wm_correction_scale', type=float, default=1.0,
-                        help='scale multiplier for tanh-limited fused memory correction')
-    parser.add_argument('--wm_conflict_weight', type=float, default=0.0,
-                        help='optional penalty on alpha-scaled correction magnitude')
+                        help='temperature for online soft attention over prototype keys')
     parser.add_argument('--wm_delta_clamp', type=float, default=3.0,
-                        help='clamp value for residual adapter target; <=0 disables clamping')
-    parser.add_argument('--wm_traj_weight', type=float, default=0.0,
-                        help='deprecated; retained for compatibility')
-    parser.add_argument('--wm_base_weight', type=float, default=0.0,
-                        help='deprecated; retained for compatibility')
+                        help='clamp value for stored normalized residual correction; <=0 disables clamping')
     parser.add_argument('--wm_mae_weight', type=float, default=0.0,
                         help='optional MAE term added to final prediction loss')
     parser.add_argument('--wm_freq_loss_weight', type=float, default=0.0,
@@ -259,6 +243,8 @@ if __name__ == '__main__':
                         help='rebuild BranchWorld memory after each epoch before validation')
     parser.add_argument('--eval_test_each_epoch', type=int, choices=[0, 1], default=1,
                         help='debug option: evaluate test set every epoch; set 0 for formal final-only testing')
+    parser.add_argument('--wm_proto_align_weight', type=float, default=0.0)
+    parser.add_argument('--wm_proto_align_detach_future', type=int, choices=[0, 1], default=1)
 
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:
