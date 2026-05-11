@@ -245,6 +245,7 @@ if __name__ == '__main__':
                         help='debug option: evaluate test set every epoch; set 0 for formal final-only testing')
     parser.add_argument('--wm_proto_align_weight', type=float, default=0.0)
     parser.add_argument('--wm_proto_align_detach_future', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--wm_proto_align_tau', type=float, default=1.0)
 
     args = parser.parse_args()
     if torch.cuda.is_available() and args.use_gpu:

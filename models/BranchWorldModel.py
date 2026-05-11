@@ -116,6 +116,9 @@ class Model(nn.Module):
         self.base_checkpoint = getattr(configs, "wm_base_checkpoint", "")
         self.freeze_base = bool(getattr(configs, "wm_freeze_base", 1))
         self.freeze_encoder = bool(getattr(configs, "wm_freeze_encoder", 1))
+        self.proto_align_weight = float(getattr(configs, "wm_proto_align_weight", 0.0))
+        self.proto_align_detach_future = bool(getattr(configs, "wm_proto_align_detach_future", 1))
+        self.proto_align_tau = max(float(getattr(configs, "wm_proto_align_tau", 1.0)), 1e-6)
 
         horizons = getattr(configs, "wm_horizons", None)
         if horizons is None or len(horizons) == 0:
@@ -490,6 +493,14 @@ class Model(nn.Module):
         centers = self.prototype_trajectories.flatten(start_dim=1)
         flat = trajectory.flatten(start_dim=1)
         return torch.cdist(flat, centers).argmin(dim=1)
+    
+    def _soft_cluster_targets(self, trajectory):
+        if self.prototype_trajectories.numel() == 0:
+            return None
+        centers = self.prototype_trajectories.flatten(start_dim=1)
+        flat = trajectory.flatten(start_dim=1)
+        dists = torch.cdist(flat, centers).pow(2)
+        return torch.softmax(-dists / self.proto_align_tau, dim=1)
 
     def _series_summary(self, series):
         first = series[:, 0, :]
@@ -560,23 +571,22 @@ class Model(nn.Module):
         _, key = self.state_encoder(norm_x)
         norm_future = None
         oracle_labels = None
+        soft_targets = None
 
         need_proto_label = (
-        self.attention_mode == "oracle"
-        or (self.attention_mode == "linear" and self.predictor_loss == "ce")
-        or (self.training and self.proto_align_weight > 0)
+            self.attention_mode == "oracle"
+            or (self.attention_mode == "linear" and self.predictor_loss == "ce")
+            or (self.training and self.proto_align_weight > 0)
         )
         if future_y is not None:
             if future_y.size(-1) != self.c_out:
                 future_y = future_y[:, :, -self.c_out:]
             norm_future = (future_y - means[:, :, -future_y.size(-1):]) / stdev[:, :, -future_y.size(-1):]
-            if (
-                self.attention_mode == "oracle"
-                or (self.attention_mode == "linear" and self.predictor_loss == "ce")
-            ) and self.prototype_trajectories.numel() > 0:
-                with torch.set_grad_enabled(False):
-                    _, _, trajectory = self._encode_trajectory(norm_x, norm_future)
-                oracle_labels = self._assign_cluster_labels(trajectory.detach())
+            if need_proto_label and self.prototype_trajectories.numel() > 0:
+                _, _, trajectory = self._encode_trajectory(norm_x, norm_future)
+                traj_for_target = trajectory.detach() if self.proto_align_detach_future else trajectory
+                oracle_labels = self._assign_cluster_labels(traj_for_target.detach())
+                soft_targets = self._soft_cluster_targets(traj_for_target)
 
         correction, weights, logits = self._memory_correction(key, y_base, norm_x=norm_x, oracle_labels=oracle_labels)
         effective_correction = correction
@@ -644,7 +654,37 @@ class Model(nn.Module):
                 and self.predictor_entropy_weight > 0
                 and weights.numel() > 0
             ):
-                self._last_aux_loss = -self.predictor_entropy_weight * weight_entropy
+                entropy_aux = -self.predictor_entropy_weight * weight_entropy
+                if self._last_aux_loss is None:
+                    self._last_aux_loss = entropy_aux
+                else:
+                    self._last_aux_loss = self._last_aux_loss + entropy_aux
+
+            if (
+                self.training
+                and self.proto_align_weight > 0
+                and logits.numel() > 0
+                and soft_targets is not None
+                and oracle_labels is not None
+            ):
+                log_probs = F.log_softmax(logits, dim=1)
+                proto_align_loss = F.kl_div(
+                    log_probs,
+                    soft_targets.detach(),
+                    reduction="batchmean",
+                )
+                proto_align_acc = (logits.detach().argmax(dim=1) == oracle_labels).float().mean()
+
+                stats.update({
+                    "proto_align_loss": proto_align_loss.detach(),
+                    "proto_align_acc": proto_align_acc.detach(),
+                })
+
+                proto_aux = self.proto_align_weight * proto_align_loss
+                if self._last_aux_loss is None:
+                    self._last_aux_loss = proto_aux
+                else:
+                    self._last_aux_loss = self._last_aux_loss + proto_aux
 
         self._last_memory_stats = stats
         return pred, means, stdev
